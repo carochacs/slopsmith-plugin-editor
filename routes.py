@@ -794,6 +794,96 @@ def setup(app, context):
         except Exception as e:
             return JSONResponse({"error": str(e)}, 500)
 
+    # ── Replace audio on a loaded session ────────────────────────────
+
+    @app.post("/api/plugins/editor/replace-audio")
+    async def replace_audio(data: dict):
+        """Swap the audio track for a loaded session.
+
+        Behavior by session kind:
+
+        - **dir-form sloppak**: copies the new audio into
+          ``<source_dir>/stems/`` and rewrites ``manifest.yaml`` to a single
+          ``"full"`` stem. ``source_dir`` IS the on-disk sloppak, so the
+          change persists immediately (``persisted=True``, ``next_step="none"``).
+          The wholesale stems-replacement is intentional — for multi-stem
+          projects (guitar/bass/drums splits), merely swapping the "full"
+          entry would leave other entries pointing at the now-stale mix.
+
+        - **zip-form sloppak**: same writes, but ``source_dir`` is the
+          unpack cache, so the on-disk ``.sloppak`` archive isn't touched
+          until the user hits Save (which re-zips). Returned as
+          ``persisted=False, next_step="save"`` so the UI can prompt.
+
+        - **create-mode (fresh GP import)**: only ``session["audio_file"]``
+          is updated. The next Build CDLC will produce a ``.psarc``
+          referencing the new audio. ``persisted=False, next_step="build"``.
+
+        - **loaded PSARC**: only ``session["audio_file"]`` is updated; the
+          editor uses the new audio for playback, but there is no
+          in-editor flow that repacks WEMs into the original ``.psarc``.
+          ``persisted=False, next_step="rebuild"`` — the UI surfaces this
+          as playback-only.
+        """
+        session_id = data.get("session_id", "")
+        audio_url = (data.get("audio_url") or "").strip()
+        session = sessions.get(session_id)
+        if not session:
+            return JSONResponse({"error": "session not found"}, 404)
+        src = _resolve_storage_url(audio_url)
+        if src is None or not src.exists():
+            return JSONResponse({"error": "invalid audio_url"}, 400)
+
+        session["last_touched"] = time.time()
+        session["audio_file"] = str(src)
+        persisted = False
+        # next_step tells the client which UI hint to show when not persisted.
+        # "none"    — already on disk
+        # "save"    — zip-form sloppak: cache updated, Save will re-zip
+        # "build"   — create-mode: Build CDLC will produce a .psarc with the new audio
+        # "rebuild" — loaded PSARC: no in-editor persist path (would need WEM repack)
+        next_step = "rebuild"
+        if session.get("create_mode"):
+            next_step = "build"
+
+        if session.get("format") == "sloppak" and session.get("sloppak_state"):
+            sloppak_form = session["sloppak_state"].get("form") or "zip"
+            try:
+                source_dir = Path(session["dir"]).resolve()
+                stems_dir = source_dir / "stems"
+                stems_dir.mkdir(parents=True, exist_ok=True)
+                safe_stem = re.sub(r"[^a-zA-Z0-9_-]", "_", src.stem)[:60] or "full"
+                dest = (stems_dir / f"{safe_stem}{src.suffix}").resolve()
+                # Path traversal guard — mirrors _safe_stem_path.
+                try:
+                    dest.relative_to(source_dir)
+                except ValueError:
+                    return JSONResponse({"error": "stem path escapes session dir"}, 400)
+                shutil.copy2(src, dest)
+
+                manifest = dict(session["sloppak_state"].get("manifest") or {})
+                rel = f"stems/{dest.name}"
+                manifest["stems"] = [{"id": "full", "file": rel}]
+                (source_dir / "manifest.yaml").write_text(
+                    yaml.safe_dump(manifest, sort_keys=False, allow_unicode=True),
+                    encoding="utf-8",
+                )
+                session["sloppak_state"]["manifest"] = manifest
+                # Only dir-form sloppaks are persisted: zip-form's source_dir is
+                # the unpack cache, so the on-disk .sloppak archive isn't touched
+                # until the user hits Save (which re-zips). Be honest about that
+                # to the UI so the user knows whether further action is needed.
+                if sloppak_form == "dir":
+                    persisted = True
+                    next_step = "none"
+                else:
+                    next_step = "save"
+            except Exception as e:
+                print(f"[Editor] replace-audio sloppak persist failed: {e}")
+                return JSONResponse({"error": f"persist failed: {e}"}, 500)
+
+        return {"audio_url": audio_url, "persisted": persisted, "next_step": next_step}
+
     # ── Import Guitar Pro file ───────────────────────────────────────
 
     @app.post("/api/plugins/editor/import-gp")

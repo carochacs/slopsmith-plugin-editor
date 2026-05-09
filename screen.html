@@ -22,6 +22,7 @@
         <button id="editor-load-btn" onclick="editorShowLoadModal()" class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs font-medium">Load</button>
         <button id="editor-create-btn" onclick="editorShowCreateModal()" class="px-3 py-1 bg-green-800 hover:bg-green-700 rounded text-xs font-medium">Create</button>
         <button id="editor-save-btn" onclick="editorSave()" class="px-3 py-1 bg-accent hover:bg-accent-light rounded text-xs font-medium" disabled>Save</button>
+        <button id="editor-replace-audio-btn" onclick="editorShowReplaceAudioModal()" class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs font-medium hidden" title="Replace the audio track">Replace Audio</button>
         <button id="editor-build-btn" onclick="editorBuild()" class="px-3 py-1 bg-purple-800 hover:bg-purple-700 rounded text-xs font-medium hidden">Build CDLC</button>
         <button id="editor-add-drums-btn" onclick="editorShowAddDrumsModal()" class="px-3 py-1 bg-red-900 hover:bg-red-800 rounded text-xs font-medium hidden">+ Drums</button>
         <button id="editor-add-keys-btn" onclick="editorShowAddKeysModal()" class="px-3 py-1 bg-indigo-900 hover:bg-indigo-800 rounded text-xs font-medium hidden">+ Keys</button>
@@ -204,6 +205,46 @@
                 Import & Open in Editor
             </button>
             <div id="editor-create-status" class="text-xs text-gray-500"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Replace audio modal -->
+<div id="editor-replace-audio-modal" class="hidden absolute inset-0 z-50 flex items-center justify-center" style="background:rgba(0,0,0,0.7)">
+    <div class="bg-dark-700 rounded-xl border border-gray-700 w-full max-w-md flex flex-col">
+        <div class="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+            <span class="text-sm font-medium">Replace Audio</span>
+            <button onclick="editorHideReplaceAudioModal()" class="text-gray-500 hover:text-white">&times;</button>
+        </div>
+        <div class="p-4 space-y-4">
+            <div>
+                <label class="text-xs font-medium text-gray-400 mb-1 block">Audio Source</label>
+                <div class="flex gap-2 mb-2">
+                    <button onclick="editorSetReplaceAudioMode('file')" id="editor-replace-mode-file"
+                        class="px-3 py-1 bg-accent rounded text-xs">Upload File</button>
+                    <button onclick="editorSetReplaceAudioMode('youtube')" id="editor-replace-mode-yt"
+                        class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs">YouTube URL</button>
+                </div>
+                <div id="editor-replace-audio-file-input">
+                    <input type="file" id="editor-replace-audio" accept=".mp3,.wav,.ogg,.m4a,.flac"
+                        class="w-full text-xs text-gray-400 file:mr-3 file:py-1 file:px-3 file:rounded file:border-0 file:text-xs file:bg-dark-600 file:text-gray-300 hover:file:bg-dark-500">
+                </div>
+                <div id="editor-replace-audio-yt-input" class="hidden">
+                    <input type="text" id="editor-replace-yt-url" placeholder="https://youtube.com/watch?v=..."
+                        class="w-full bg-dark-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-300 outline-none focus:border-accent/50">
+                </div>
+                <div id="editor-replace-audio-status" class="text-xs text-gray-500 mt-1"></div>
+            </div>
+            <div class="flex gap-2">
+                <button onclick="editorApplyReplaceAudio()" id="editor-replace-audio-apply"
+                    class="flex-1 px-4 py-2 bg-accent hover:bg-accent-light rounded-lg text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed">
+                    Apply
+                </button>
+                <button onclick="editorHideReplaceAudioModal()"
+                    class="flex-1 px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm font-medium">
+                    Cancel
+                </button>
+            </div>
         </div>
     </div>
 </div>

@@ -1508,6 +1508,7 @@ async function loadCDLC(filename) {
         document.getElementById('editor-build-btn').classList.add('hidden');
         document.getElementById('editor-play-btn').disabled = !data.audio_url;
         document.getElementById('editor-sync-btn').classList.toggle('hidden', !data.audio_url);
+        document.getElementById('editor-replace-audio-btn').classList.remove('hidden');
         updateArrangementSelector();
         updateStatus();
         updateTimeDisplay();
@@ -2184,13 +2185,17 @@ window.editorGPFileSelected = async (input) => {
     }
 };
 
-async function uploadCreateAudio() {
-    const audioStatus = document.getElementById('editor-audio-status');
-
-    if (createState.audioMode === 'youtube') {
-        const url = document.getElementById('editor-create-yt-url').value.trim();
-        if (!url) return false;
-        audioStatus.textContent = 'Downloading from YouTube...';
+// Shared upload helper for the Create modal and the Replace Audio modal.
+// Returns the new audio URL on success or null on missing input / failure.
+// The caller is responsible for any "missing input" UX (the helper returns
+// null silently in that case so its callers can decide whether to show a
+// message — `uploadCreateAudio`'s caller prechecks; the replace flow shows
+// a "Choose a file" hint).
+async function _uploadAudioForMode({ mode, ytInputId, fileInputId, statusEl }) {
+    if (mode === 'youtube') {
+        const url = document.getElementById(ytInputId).value.trim();
+        if (!url) return null;
+        statusEl.textContent = 'Downloading from YouTube...';
         try {
             const resp = await fetch('/api/plugins/editor/youtube-audio', {
                 method: 'POST',
@@ -2198,32 +2203,41 @@ async function uploadCreateAudio() {
                 body: JSON.stringify({ url }),
             });
             const data = await resp.json();
-            if (data.error) { audioStatus.textContent = 'Error: ' + data.error; return false; }
-            createState.audioUrl = data.audio_url;
-            audioStatus.textContent = 'Audio ready: ' + (data.title || 'downloaded');
-            return true;
+            if (data.error) { statusEl.textContent = 'Error: ' + data.error; return null; }
+            statusEl.textContent = 'Audio ready: ' + (data.title || 'downloaded');
+            return data.audio_url;
         } catch (e) {
-            audioStatus.textContent = 'Download failed: ' + e.message;
-            return false;
-        }
-    } else {
-        const input = document.getElementById('editor-create-audio');
-        if (!input.files.length) return false;
-        audioStatus.textContent = 'Uploading audio...';
-        const form = new FormData();
-        form.append('file', input.files[0]);
-        try {
-            const resp = await fetch('/api/plugins/editor/upload-audio', { method: 'POST', body: form });
-            const data = await resp.json();
-            if (data.error) { audioStatus.textContent = 'Error: ' + data.error; return false; }
-            createState.audioUrl = data.audio_url;
-            audioStatus.textContent = 'Audio uploaded';
-            return true;
-        } catch (e) {
-            audioStatus.textContent = 'Upload failed: ' + e.message;
-            return false;
+            statusEl.textContent = 'Download failed: ' + e.message;
+            return null;
         }
     }
+    const input = document.getElementById(fileInputId);
+    if (!input.files.length) return null;
+    statusEl.textContent = 'Uploading audio...';
+    const form = new FormData();
+    form.append('file', input.files[0]);
+    try {
+        const resp = await fetch('/api/plugins/editor/upload-audio', { method: 'POST', body: form });
+        const data = await resp.json();
+        if (data.error) { statusEl.textContent = 'Error: ' + data.error; return null; }
+        statusEl.textContent = 'Audio uploaded';
+        return data.audio_url;
+    } catch (e) {
+        statusEl.textContent = 'Upload failed: ' + e.message;
+        return null;
+    }
+}
+
+async function uploadCreateAudio() {
+    const url = await _uploadAudioForMode({
+        mode: createState.audioMode,
+        ytInputId: 'editor-create-yt-url',
+        fileInputId: 'editor-create-audio',
+        statusEl: document.getElementById('editor-audio-status'),
+    });
+    if (!url) return false;
+    createState.audioUrl = url;
+    return true;
 }
 
 function updateCreateButton() {
@@ -2313,6 +2327,7 @@ window.editorDoCreate = async () => {
         document.getElementById('editor-build-btn').classList.remove('hidden');
         document.getElementById('editor-play-btn').disabled = !data.audio_url;
         document.getElementById('editor-sync-btn').classList.toggle('hidden', !data.audio_url);
+        document.getElementById('editor-replace-audio-btn').classList.remove('hidden');
         updateArrangementSelector();
         updateStatus();
         updateTimeDisplay();
@@ -2386,6 +2401,118 @@ window.editorBuild = async () => {
         // Re-flatten current arrangement for continued editing
         flattenChords();
         draw();
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════
+// Replace audio
+// ════════════════════════════════════════════════════════════════════
+
+let replaceAudioState = { audioMode: 'file' };
+
+window.editorShowReplaceAudioModal = () => {
+    if (!S.sessionId) return;
+    replaceAudioState = { audioMode: 'file' };
+    document.getElementById('editor-replace-audio').value = '';
+    document.getElementById('editor-replace-yt-url').value = '';
+    document.getElementById('editor-replace-audio-status').textContent = '';
+    document.getElementById('editor-replace-audio-apply').disabled = false;
+    document.getElementById('editor-replace-audio-modal').classList.remove('hidden');
+    editorSetReplaceAudioMode('file');
+};
+
+window.editorHideReplaceAudioModal = () => {
+    document.getElementById('editor-replace-audio-modal').classList.add('hidden');
+};
+
+window.editorSetReplaceAudioMode = (mode) => {
+    replaceAudioState.audioMode = mode;
+    document.getElementById('editor-replace-audio-file-input').classList.toggle('hidden', mode !== 'file');
+    document.getElementById('editor-replace-audio-yt-input').classList.toggle('hidden', mode !== 'youtube');
+    document.getElementById('editor-replace-mode-file').className =
+        'px-3 py-1 rounded text-xs ' + (mode === 'file' ? 'bg-accent' : 'bg-dark-600 hover:bg-dark-500');
+    document.getElementById('editor-replace-mode-yt').className =
+        'px-3 py-1 rounded text-xs ' + (mode === 'youtube' ? 'bg-accent' : 'bg-dark-600 hover:bg-dark-500');
+};
+
+async function _uploadReplaceAudio() {
+    const statusEl = document.getElementById('editor-replace-audio-status');
+    // Pre-check missing input so we surface a hint here (the shared helper
+    // returns null silently on missing input so the create-modal flow's
+    // optional-audio path keeps its existing no-status behavior).
+    if (replaceAudioState.audioMode === 'youtube') {
+        if (!document.getElementById('editor-replace-yt-url').value.trim()) {
+            statusEl.textContent = 'Enter a YouTube URL';
+            return null;
+        }
+    } else if (!document.getElementById('editor-replace-audio').files.length) {
+        statusEl.textContent = 'Choose a file';
+        return null;
+    }
+    return _uploadAudioForMode({
+        mode: replaceAudioState.audioMode,
+        ytInputId: 'editor-replace-yt-url',
+        fileInputId: 'editor-replace-audio',
+        statusEl,
+    });
+}
+
+window.editorApplyReplaceAudio = async () => {
+    if (!S.sessionId) return;
+    const status = document.getElementById('editor-replace-audio-status');
+    const apply = document.getElementById('editor-replace-audio-apply');
+    apply.disabled = true;
+    try {
+        const audioUrl = await _uploadReplaceAudio();
+        if (!audioUrl) { apply.disabled = false; return; }
+
+        const resp = await fetch('/api/plugins/editor/replace-audio', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: S.sessionId, audio_url: audioUrl }),
+        });
+        const data = await resp.json();
+        if (data.error) {
+            status.textContent = 'Error: ' + data.error;
+            apply.disabled = false;
+            return;
+        }
+
+        // Keep create-mode build in sync — Build CDLC reads createState.audioUrl.
+        if (S.createMode) createState.audioUrl = audioUrl;
+
+        // Stop active playback before swapping the buffer; otherwise the old
+        // BufferSource keeps playing under the new S.audioBuffer/duration and
+        // playbackTick desyncs against the new track length.
+        if (S.playing) stopPlayback();
+        // loadAudio() swallows fetch/decode errors and only logs to console,
+        // so detect failure by checking that the buffer reference actually
+        // changed. Without this we would close the modal and announce
+        // "Audio replaced" even on an unsupported / corrupt upload.
+        const prevBuffer = S.audioBuffer;
+        await loadAudio(audioUrl);
+        if (!S.audioBuffer || S.audioBuffer === prevBuffer) {
+            status.textContent = 'Failed to decode audio (unsupported format?)';
+            apply.disabled = false;
+            return;
+        }
+        if (S.cursorTime > S.duration) S.cursorTime = 0;
+        document.getElementById('editor-play-btn').disabled = false;
+        document.getElementById('editor-sync-btn').classList.remove('hidden');
+        updateTimeDisplay();
+        draw();
+
+        const HINTS = {
+            none:    'Audio replaced',
+            save:    'Audio replaced (Save to persist to .sloppak)',
+            build:   'Audio replaced (will persist on next Build CDLC)',
+            rebuild: "Audio replaced (playback only — PSARC won't be repacked)",
+        };
+        editorHideReplaceAudioModal();
+        setStatus(HINTS[data.next_step] || (data.persisted ? HINTS.none : HINTS.rebuild));
+    } catch (e) {
+        status.textContent = 'Failed: ' + e.message;
+        apply.disabled = false;
     }
 };
 
