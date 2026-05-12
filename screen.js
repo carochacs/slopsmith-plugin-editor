@@ -7,20 +7,42 @@
 // Constants
 // ════════════════════════════════════════════════════════════════════
 
-const STRING_COLORS = [
-    '#FC3A51', // 0 low E — red
-    '#FFC600', // 1 A     — yellow
-    '#3FAAFF', // 2 D     — blue
-    '#FF8A00', // 3 G     — orange
-    '#58D263', // 4 B     — green
-    '#C473FF', // 5 high e — purple
-];
-// Display: lane 0 = high e (top), lane 5 = low E (bottom)
-const LANE_LABELS = ['e', 'B', 'G', 'D', 'A', 'E'];
+// Highway colours, keyed by pitch *label* (the same labels `laneLabels()`
+// emits) so colours stay locked to a string's note regardless of the
+// arrangement's string count. A 4-string bass G/D/A/E gets
+// orange/blue/yellow/red just like the same pitches on a 6-string
+// guitar. Extended-range strings (7/8-guitar's low B/F#, 6-bass's high C)
+// reuse the dusty-pink/steel-blue accents.
+const STRING_LABEL_COLORS = {
+    'E':  '#FC3A51', // low E   — red
+    'A':  '#FFC600', // A       — yellow
+    'D':  '#3FAAFF', // D       — blue
+    'G':  '#FF8A00', // G       — orange
+    'B':  '#58D263', // B       — green (guitar string 4)
+    'e':  '#C473FF', // high e  — purple
+    'B↓': '#E07A8A', // 7-string low B          — dusty pink
+    'C↑': '#E07A8A', // 6-string bass high C    — dusty pink
+    'F#↓': '#8AA0B8',// 8-string low F#         — steel blue
+};
+
+// Cached per-frame alongside `lanes()` to avoid re-allocating
+// `laneLabels()` per note inside drawNotes / drawLabels.
+let _laneLabelsCacheValue = null;
+function colorForLane(l) {
+    // `laneLabels()` is low → high (string-index order); strToLane
+    // converts string index → lane. During draw() the cache is hot
+    // (set once per frame), so per-note colorForLane reads a single
+    // index rather than re-running the label computation.
+    const labels = _lanesCacheActive && _laneLabelsCacheValue
+        ? _laneLabelsCacheValue
+        : laneLabels();
+    const lbl = labels[laneToStr(l)];
+    return STRING_LABEL_COLORS[lbl] || '#888';
+}
 
 let WAVEFORM_H = 70;
 let LANE_H = 44;
-const LANES = 6;
+const MAX_LANES = 8;
 let BEAT_H = 24;
 const LABEL_W = 52;
 const MIN_NOTE_W = 18;
@@ -90,17 +112,128 @@ let rafId = null;
 // Coordinate mapping
 // ════════════════════════════════════════════════════════════════════
 
+function isBassArr() {
+    if (!S.arrangements.length) return false;
+    const arr = S.arrangements[S.currentArr];
+    return !!arr && /bass/i.test(arr.name || '');
+}
+
+// Active arrangement string count. Mirrors lib/song.py:arrangement_string_count
+// so the editor agrees with the highway: combine name-based default (Bass→4,
+// else→6), tuning length when ≠6 (length 6 is RS-schema padding), an
+// explicit `_extendedStrings` counter that AddStringCmd / RemoveStringCmd
+// bump (disambiguates the bass-with-tuning-length-6 case — could be
+// either a 4-string padded or a genuine 6-string), chord-template width,
+// and the max note-string index. Clamped to [4, MAX_LANES].
+//
+// `lanes()` is O(N) over notes+chords and is on the hot path (strToLane /
+// laneToStr / yToStr are called per-note inside drawNotes and per-mousemove
+// in hit-testing). To avoid the resulting O(N²) per frame on large
+// arrangements, draw() seeds a per-frame cache that this function reads
+// from when active. Mutations outside the draw frame still recompute.
+let _lanesCacheActive = false;
+let _lanesCacheValue = 6;
+// Seed `_extendedStrings` from each arrangement's tuning length. Two
+// modes:
+//   * Always seed when `tuningLen > 6` — RS-XML never pads past 6, so
+//     any length above that is an unambiguous extended-range signal
+//     (string6+ attrs were emitted). Applies to all sources including
+//     a previously-extended PSARC reloaded in this session.
+//   * When `authoritativeLength` is true (sloppak / GP-imported create-
+//     mode), also seed when `tuningLen > baseline` even if ≤ 6 —
+//     those sources don't apply RS padding, so a 6-slot bass tuning
+//     genuinely means 6-string bass. Skipping this path for PSARC
+//     loads preserves the standard bass-padded-to-6 → 4 inference.
+function _seedExtendedStringsFromTuning(arrangements, authoritativeLength) {
+    for (const arr of arrangements || []) {
+        if (typeof arr._extendedStrings === 'number') continue;  // already set
+        const isBass = /bass/i.test(arr.name || '');
+        const baseline = isBass ? 4 : 6;
+        const tuningLen = Array.isArray(arr.tuning) ? arr.tuning.length : baseline;
+        if (tuningLen > 6) {
+            arr._extendedStrings = tuningLen - baseline;
+        } else if (authoritativeLength && tuningLen > baseline) {
+            arr._extendedStrings = tuningLen - baseline;
+        }
+    }
+}
+
+function _stringCountFor(arr) {
+    if (!arr) return 6;
+    const isBass = /bass/i.test(arr.name || '');
+    const baseline = isBass ? 4 : 6;
+    // User-added strings via the Strings modal — authoritative even
+    // when tuning happens to be ambiguous length 6 (the standard RS-XML
+    // bass padding length).
+    let n = baseline + Math.max(0, arr._extendedStrings || 0);
+    const tuningLen = Array.isArray(arr.tuning) ? arr.tuning.length : 6;
+    if (tuningLen !== 6) n = Math.max(n, tuningLen);
+    // Chord-template signal: count the highest *used* fret slot (not
+    // the raw array length). RS XML pads chord_templates to width 6
+    // unconditionally, so a 4-string bass arrangement also has
+    // ct.frets.length === 6 with fret[4..5] === -1. Looking at the
+    // last non(-1) index instead means a 4-string bass with no notes
+    // on string 4/5 reads as 4 (correct), and a real 6/7-string
+    // template that played notes on those high strings still bumps
+    // `n` up.
+    for (const ct of arr.chord_templates || []) {
+        if (Array.isArray(ct.frets)) {
+            for (let i = ct.frets.length - 1; i >= 0; i--) {
+                if (ct.frets[i] !== -1) {
+                    if (i + 1 > n) n = i + 1;
+                    break;
+                }
+            }
+        }
+    }
+    for (const note of arr.notes || []) {
+        if (note.string + 1 > n) n = note.string + 1;
+    }
+    for (const ch of arr.chords || []) {
+        for (const cn of ch.notes || []) {
+            if (cn.string + 1 > n) n = cn.string + 1;
+        }
+    }
+    return Math.max(4, Math.min(MAX_LANES, n));
+}
+function lanes() {
+    if (_lanesCacheActive) return _lanesCacheValue;
+    if (!S.arrangements.length) return 6;
+    return _stringCountFor(S.arrangements[S.currentArr]);
+}
+// Build display labels in RS string-index order (low → high). Extended-range
+// instruments add strings at the low end (7-string guitar adds low B below
+// low E; 5-string bass adds low B below low E), and 6-string bass adds high
+// C on top. The arrow notation marks those non-standard strings.
+function laneLabels() {
+    const L = lanes();
+    if (isBassArr()) {
+        // 4-string standard: E A D G
+        // 5-string: B↓ E A D G  (low B added)
+        // 6-string: B↓ E A D G C (low B + high C added)
+        if (L <= 4) return ['E', 'A', 'D', 'G'].slice(0, L);
+        if (L === 5) return ['B↓', 'E', 'A', 'D', 'G'];
+        return ['B↓', 'E', 'A', 'D', 'G', 'C↑'].slice(0, L);
+    }
+    // Guitar standard: E A D G B e (low → high)
+    // 7-string: B↓ E A D G B e  (low B added)
+    // 8-string: F#↓ B↓ E A D G B e (low F# and low B added)
+    if (L <= 6) return ['E', 'A', 'D', 'G', 'B', 'e'].slice(0, L);
+    if (L === 7) return ['B↓', 'E', 'A', 'D', 'G', 'B', 'e'];
+    return ['F#↓', 'B↓', 'E', 'A', 'D', 'G', 'B', 'e'].slice(0, L);
+}
+
 function timeToX(t)  { return LABEL_W + (t - S.scrollX) * S.zoom; }
 function xToTime(x)  { return (x - LABEL_W) / S.zoom + S.scrollX; }
 function laneToY(l)  { return WAVEFORM_H + l * LANE_H; }
 function yToLane(y)  { return Math.floor((y - WAVEFORM_H) / LANE_H); }
-function strToLane(s) { return 5 - s; }
-function laneToStr(l) { return 5 - l; }
+function strToLane(s) { return (lanes() - 1) - s; }
+function laneToStr(l) { return (lanes() - 1) - l; }
 function strToY(s)   { return laneToY(strToLane(s)); }
-function yToStr(y)   { const l = Math.max(0, Math.min(5, yToLane(y))); return laneToStr(l); }
+function yToStr(y)   { const l = Math.max(0, Math.min(lanes() - 1, yToLane(y))); return laneToStr(l); }
 function canvasH()   {
     if (isKeysMode()) return WAVEFORM_H + pianoLaneCount() * PIANO_LANE_H + BEAT_H;
-    return WAVEFORM_H + LANES * LANE_H + BEAT_H;
+    return WAVEFORM_H + lanes() * LANE_H + BEAT_H;
 }
 
 // ── Piano roll mode helpers ─────────────────────────────────────────
@@ -234,9 +367,10 @@ function reconstructChords() {
             newNotes.push(group[0]);
         } else {
             // Multiple notes at same time = chord
-            const frets = [-1, -1, -1, -1, -1, -1];
+            const L = lanes();
+            const frets = new Array(L).fill(-1);
             for (const n of group) {
-                if (n.string >= 0 && n.string < 6) frets[n.string] = n.fret;
+                if (n.string >= 0 && n.string < L) frets[n.string] = n.fret;
             }
             const fretKey = frets.join(',');
             let tmplIdx;
@@ -247,7 +381,11 @@ function reconstructChords() {
                 chordTemplates.push({
                     name: '',
                     frets: [...frets],
-                    fingers: [-1, -1, -1, -1, -1, -1],
+                    // Match `frets` width — on 7/8-string charts the
+                    // template would otherwise have inconsistent
+                    // frets.length=L but fingers.length=6, which
+                    // serializes to misaligned `fingerN` slots.
+                    fingers: new Array(L).fill(-1),
                 });
                 templateMap[fretKey] = tmplIdx;
             }
@@ -282,16 +420,32 @@ function draw() {
     ctx.scale(DPR, DPR);
     ctx.clearRect(0, 0, w, h);
 
-    drawWaveform(w);
-    drawLanes(w);
-    drawGrid(w);
-    drawSections(w);
-    drawBeatBar(w);
-    drawNotes(w);
-    drawSelectionRect(w);
-    drawGhostNotes();
-    drawCursor(w, h);
-    drawLabels(w);
+    // Seed the per-frame `lanes()` cache. drawNotes calls strToLane on every
+    // note (and per-note hit tests do the same), so without this every
+    // frame is O(N²) over the arrangement. The labels array is cached
+    // alongside since `colorForLane` reads it once per note. Enable
+    // the cache BEFORE calling `laneLabels()` so that helper's internal
+    // `lanes()` call hits the cache too (otherwise we'd do two full
+    // O(N) scans per frame).
+    _lanesCacheActive = false;  // force a real compute first
+    _lanesCacheValue = lanes();
+    _lanesCacheActive = true;
+    _laneLabelsCacheValue = laneLabels();
+    try {
+        drawWaveform(w);
+        drawLanes(w);
+        drawGrid(w);
+        drawSections(w);
+        drawBeatBar(w);
+        drawNotes(w);
+        drawSelectionRect(w);
+        drawGhostNotes();
+        drawCursor(w, h);
+        drawLabels(w);
+    } finally {
+        _lanesCacheActive = false;
+        _laneLabelsCacheValue = null;
+    }
 
     ctx.restore();
 }
@@ -316,7 +470,8 @@ function drawWaveform(w) {
 
 function drawLanes(w) {
     if (isKeysMode()) return drawPianoLanes(w);
-    for (let l = 0; l < LANES; l++) {
+    const L = lanes();
+    for (let l = 0; l < L; l++) {
         const y = laneToY(l);
         ctx.fillStyle = l % 2 === 0 ? '#0c0c1c' : '#0f0f24';
         ctx.fillRect(LABEL_W, y, w - LABEL_W, LANE_H);
@@ -354,7 +509,7 @@ function drawGrid(w) {
     const et = S.scrollX + (w - LABEL_W) / S.zoom + 1;
     const laneBottom = isKeysMode()
         ? WAVEFORM_H + pianoLaneCount() * PIANO_LANE_H
-        : WAVEFORM_H + LANES * LANE_H;
+        : WAVEFORM_H + lanes() * LANE_H;
     for (const b of S.beats) {
         if (b.time < st || b.time > et) continue;
         const x = timeToX(b.time);
@@ -374,7 +529,7 @@ function drawSections(w) {
     const et = S.scrollX + (w - LABEL_W) / S.zoom + 1;
     const laneBottom = isKeysMode()
         ? WAVEFORM_H + pianoLaneCount() * PIANO_LANE_H
-        : WAVEFORM_H + LANES * LANE_H;
+        : WAVEFORM_H + lanes() * LANE_H;
     ctx.font = '9px monospace';
     ctx.textBaseline = 'top';
     for (const s of S.sections) {
@@ -398,7 +553,7 @@ function drawSections(w) {
 }
 
 function drawBeatBar(w) {
-    const y = WAVEFORM_H + LANES * LANE_H;
+    const y = WAVEFORM_H + lanes() * LANE_H;
     ctx.fillStyle = '#08081a';
     ctx.fillRect(0, y, w, BEAT_H);
     ctx.fillStyle = '#08081a';
@@ -430,17 +585,23 @@ function drawLabels(w) {
 
     if (isKeysMode()) return drawPianoLabels(w);
 
-    // String labels
-    for (let l = 0; l < LANES; l++) {
+    // String labels. `labels` is in RS string-index order (low → high); lanes
+    // are drawn high-to-low (lane 0 = top = highest string). Colours come
+    // from `colorForLane()` which looks up the string's pitch label in
+    // `STRING_LABEL_COLORS` — so a 4-string bass G/D/A/E reads orange/blue/
+    // yellow/red just like the same pitches on a 6-string guitar.
+    const L = lanes();
+    const labels = laneLabels();
+    for (let l = 0; l < L; l++) {
         const y = laneToY(l);
         ctx.fillStyle = '#0a0a1a';
         ctx.fillRect(0, y, LABEL_W, LANE_H);
         const s = laneToStr(l);
-        ctx.fillStyle = STRING_COLORS[s];
+        ctx.fillStyle = colorForLane(l);
         ctx.font = 'bold 12px monospace';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText(LANE_LABELS[l], LABEL_W / 2, y + LANE_H / 2);
+        ctx.fillText(labels[s] || String(s), LABEL_W / 2, y + LANE_H / 2);
     }
 }
 
@@ -485,7 +646,7 @@ function _drawNote(n, selected) {
     const y = strToY(n.string) + NOTE_PAD;
     const sw = Math.max(MIN_NOTE_W, (n.sustain || 0) * S.zoom);
     const h = LANE_H - NOTE_PAD * 2;
-    const color = STRING_COLORS[n.string] || '#888';
+    const color = colorForLane(strToLane(n.string));
 
     // Body
     ctx.fillStyle = color + 'cc';
@@ -754,6 +915,223 @@ class ChangeFretCmd {
     rollback() { notes()[this.index].fret = this.oldFret; }
 }
 
+// Extend an arrangement's string count by one. `position` is 'low' for
+// adding at the lowest end (guitar low B/F#, 4→5-string bass low B) and
+// 'high' for adding at the high end (5→6-string bass high C). Adding at
+// the low end shifts every existing note's string index up by 1 so the
+// chart visually stays put — only the new lowest lane is empty.
+// Layout side-effect for any command that changes `lanes()`. Pulled
+// out so AddStringCmd / RemoveStringCmd exec & rollback can drive a
+// LANE_H recomputation on Ctrl-Z / Ctrl-Y too. Takes the target
+// arrangement index because undo/redo may fire after the user has
+// switched to a different arrangement — only resize when the
+// mutation hits the visible chart, so we don't mis-size LANE_H on
+// behalf of an off-screen arrangement.
+//
+// We defer to the next animation frame so the click-handler reflow
+// completes before resizeCanvas reads `wrap.clientHeight`. Calling
+// inline can hit a transient layout where the read returns 0; the
+// early-return inside resizeCanvas then skips the LANE_H update,
+// extra lanes overflow the canvas, and the new string isn't visible
+// until the next legitimate resize event (e.g. screen-change observer).
+function _resizeForLaneChange(arrIdx) {
+    if (typeof resizeCanvas !== 'function') return;
+    if (arrIdx !== undefined && arrIdx !== S.currentArr) return;
+    requestAnimationFrame(() => resizeCanvas());
+}
+
+// Normalize `arr.tuning` so its length equals the arrangement's *real*
+// string count instead of the RS-XML padded length (which is always 6
+// for both 4-string bass and 6-string guitar). Without this, an
+// add-string on a 4-string bass loaded from RS XML would treat the
+// padded 6-slot tuning as 6 real strings and extend to 7. We slice
+// excess zero-tail padding when tuning.length > realCount and pad
+// when shorter. Idempotent — safe to call before every mutation.
+function _normalizeTuningToLanes(arr, realCount) {
+    let t = Array.isArray(arr.tuning) ? arr.tuning.slice() : [];
+    if (t.length > realCount) {
+        // Drop trailing zeros first (RS-XML padding). Callers compute
+        // `realCount` via `_stringCountFor(arr)` which already factors
+        // in any non-zero high-index offsets, so anything left after
+        // that trim is stale and the explicit slice below honours the
+        // length contract.
+        while (t.length > realCount && t[t.length - 1] === 0) {
+            t.pop();
+        }
+        if (t.length > realCount) {
+            t = t.slice(0, realCount);
+        }
+    }
+    while (t.length < realCount) t.push(0);
+    arr.tuning = t;
+}
+
+class AddStringCmd {
+    constructor(arrIdx, position) {
+        this.arrIdx = arrIdx;
+        this.position = position;
+    }
+    _arr() { return S.arrangements[this.arrIdx]; }
+    exec() {
+        const arr = this._arr();
+        // Normalize against `_stringCountFor(arr)` rather than the
+        // global `lanes()` which reads from `S.currentArr`. Undo/redo
+        // can fire after the user has switched arrangements, so we
+        // must compute the count against the command's TARGET arr.
+        _normalizeTuningToLanes(arr, _stringCountFor(arr));
+        const tuning = arr.tuning.slice();
+        if (this.position === 'low') {
+            tuning.unshift(0);
+            for (const n of arr.notes || []) n.string += 1;
+            for (const ch of arr.chords || []) {
+                for (const cn of ch.notes || []) cn.string += 1;
+            }
+            for (const ct of arr.chord_templates || []) {
+                if (Array.isArray(ct.frets)) ct.frets.unshift(-1);
+                if (Array.isArray(ct.fingers)) ct.fingers.unshift(-1);
+            }
+        } else {
+            tuning.push(0);
+            for (const ct of arr.chord_templates || []) {
+                if (Array.isArray(ct.frets)) ct.frets.push(-1);
+                if (Array.isArray(ct.fingers)) ct.fingers.push(-1);
+            }
+        }
+        arr.tuning = tuning;
+        // Bump the explicit extension counter so lanes() / the save
+        // detection function don't have to guess when tuning.length
+        // happens to be 6 (the ambiguous bass-padded-or-real-6 case).
+        arr._extendedStrings = (arr._extendedStrings || 0) + 1;
+        _resizeForLaneChange(this.arrIdx);
+    }
+    rollback() {
+        const arr = this._arr();
+        const tuning = Array.isArray(arr.tuning) ? arr.tuning.slice() : [0, 0, 0, 0, 0, 0];
+        if (this.position === 'low') {
+            tuning.shift();
+            for (const n of arr.notes || []) n.string -= 1;
+            for (const ch of arr.chords || []) {
+                for (const cn of ch.notes || []) cn.string -= 1;
+            }
+            for (const ct of arr.chord_templates || []) {
+                if (Array.isArray(ct.frets)) ct.frets.shift();
+                if (Array.isArray(ct.fingers)) ct.fingers.shift();
+            }
+        } else {
+            tuning.pop();
+            for (const ct of arr.chord_templates || []) {
+                if (Array.isArray(ct.frets)) ct.frets.pop();
+                if (Array.isArray(ct.fingers)) ct.fingers.pop();
+            }
+        }
+        arr.tuning = tuning;
+        // AddStringCmd's rollback undoes a prior add, so decrement.
+        arr._extendedStrings = Math.max(0, (arr._extendedStrings || 0) - 1);
+        _resizeForLaneChange(this.arrIdx);
+    }
+}
+
+// Remove a string from the active arrangement. `position === 'low'` peels
+// off the low extension (guitar 7→6 / 8→7, bass 5→4); `position === 'high'`
+// peels the high C off a 6-string bass — the editor exposes both via the
+// Strings modal. Callers must first verify no notes live on the targeted
+// string (validation lives in the UI handler so the user gets a clear
+// error message in the modal rather than a silent data drop here).
+class RemoveStringCmd {
+    constructor(arrIdx, position) {
+        this.arrIdx = arrIdx;
+        this.position = position;
+        // Snapshots filled in by exec() — keeping them off the
+        // constructor means instantiation is a pure data move. If a
+        // future code path ever builds a RemoveStringCmd without
+        // running it (e.g. for previewing), the live arrangement
+        // stays untouched.
+        this.removedOffset = 0;
+        this.removedTemplateCols = [];
+    }
+    _arr() { return S.arrangements[this.arrIdx]; }
+    exec() {
+        const arr = this._arr();
+        // Normalize tuning to the real string count first so the
+        // snapshot reflects the actual column we're dropping, not an
+        // RS-XML padding zero. Snapshot happens immediately after so
+        // rollback can restore the exact pre-remove state. Use
+        // `_stringCountFor(arr)` (not `lanes()`) so undo/redo after
+        // an arrangement switch still operates on this command's
+        // TARGET arrangement.
+        _normalizeTuningToLanes(arr, _stringCountFor(arr));
+        const t = arr.tuning || [];
+        this.removedOffset = this.position === 'low' ? t[0] : t[t.length - 1];
+        this.removedTemplateCols = (arr.chord_templates || []).map(ct => {
+            const fretLen = Array.isArray(ct.frets) ? ct.frets.length : 0;
+            const fingerLen = Array.isArray(ct.fingers) ? ct.fingers.length : 0;
+            // Empty arrays would otherwise yield colIdx == -1, store
+            // `undefined`, and push that back as the rollback value —
+            // corrupting the template on undo. Fall back to -1 when
+            // the column doesn't exist.
+            const fretCol = this.position === 'low' ? 0 : fretLen - 1;
+            const fingerCol = this.position === 'low' ? 0 : fingerLen - 1;
+            return {
+                fret: fretLen > 0 && fretCol >= 0 ? ct.frets[fretCol] : -1,
+                finger: fingerLen > 0 && fingerCol >= 0 ? ct.fingers[fingerCol] : -1,
+            };
+        });
+        const tuning = arr.tuning.slice();
+        if (this.position === 'low') {
+            tuning.shift();
+            for (const n of arr.notes || []) n.string -= 1;
+            for (const ch of arr.chords || []) {
+                for (const cn of ch.notes || []) cn.string -= 1;
+            }
+            for (const ct of arr.chord_templates || []) {
+                if (Array.isArray(ct.frets)) ct.frets.shift();
+                if (Array.isArray(ct.fingers)) ct.fingers.shift();
+            }
+        } else {
+            tuning.pop();
+            for (const ct of arr.chord_templates || []) {
+                if (Array.isArray(ct.frets)) ct.frets.pop();
+                if (Array.isArray(ct.fingers)) ct.fingers.pop();
+            }
+        }
+        arr.tuning = tuning;
+        arr._extendedStrings = Math.max(0, (arr._extendedStrings || 0) - 1);
+        _resizeForLaneChange(this.arrIdx);
+    }
+    rollback() {
+        const arr = this._arr();
+        const tuning = arr.tuning.slice();
+        const restore = (ct, i) => {
+            const cols = this.removedTemplateCols[i] || { fret: -1, finger: -1 };
+            return cols;
+        };
+        if (this.position === 'low') {
+            tuning.unshift(this.removedOffset);
+            for (const n of arr.notes || []) n.string += 1;
+            for (const ch of arr.chords || []) {
+                for (const cn of ch.notes || []) cn.string += 1;
+            }
+            (arr.chord_templates || []).forEach((ct, i) => {
+                const cols = restore(ct, i);
+                if (Array.isArray(ct.frets)) ct.frets.unshift(cols.fret);
+                if (Array.isArray(ct.fingers)) ct.fingers.unshift(cols.finger);
+            });
+        } else {
+            tuning.push(this.removedOffset);
+            (arr.chord_templates || []).forEach((ct, i) => {
+                const cols = restore(ct, i);
+                if (Array.isArray(ct.frets)) ct.frets.push(cols.fret);
+                if (Array.isArray(ct.fingers)) ct.fingers.push(cols.finger);
+            });
+        }
+        arr.tuning = tuning;
+        // RemoveStringCmd's rollback restores the removed string, so
+        // re-increment the extension counter (mirrors AddStringCmd.exec).
+        arr._extendedStrings = (arr._extendedStrings || 0) + 1;
+        _resizeForLaneChange(this.arrIdx);
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════
 // Mouse interactions
 // ════════════════════════════════════════════════════════════════════
@@ -858,10 +1236,31 @@ function onMouseDown(e) {
 
 function onMouseMove(e) {
     const { x, y } = getMousePos(e);
+    // Activate the lane cache for the handler's lifetime so per-note
+    // hit-test helpers (`hitNoteEdge` / `hitNote` → `strToY` →
+    // `strToLane` → `lanes()`) stay O(1) per note instead of O(N).
+    // A local `const L = lanes()` alone doesn't help those nested
+    // calls; the global cache does. Cleared in `finally` so any
+    // exception unwinding the handler doesn't leak the flag.
+    const _prevActive = _lanesCacheActive;
+    const _prevValue = _lanesCacheValue;
+    _lanesCacheActive = false;
+    _lanesCacheValue = lanes();
+    const L = _lanesCacheValue;
+    _lanesCacheActive = true;
+    try {
+        _onMouseMoveBody(e, x, y, L);
+    } finally {
+        _lanesCacheActive = _prevActive;
+        _lanesCacheValue = _prevValue;
+    }
+}
+
+function _onMouseMoveBody(e, x, y, L) {
 
     // Cursor hint when not dragging
     if (!S.drag) {
-        if (canvas && y >= WAVEFORM_H && y < WAVEFORM_H + LANES * LANE_H) {
+        if (canvas && y >= WAVEFORM_H && y < WAVEFORM_H + L * LANE_H) {
             canvas.style.cursor = hitNoteEdge(x, y) >= 0 ? 'ew-resize' : '';
         } else if (canvas) {
             canvas.style.cursor = '';
@@ -919,7 +1318,9 @@ function onMouseMove(e) {
                 nn[ni].time = newTime;
 
                 const origLane = strToLane(S.drag.origStrings[i]);
-                const newLane = Math.max(0, Math.min(5, origLane + dLanes));
+                // Reuse the locally-cached `L` from onMouseMove instead of
+                // calling lanes() per dragged note.
+                const newLane = Math.max(0, Math.min(L - 1, origLane + dLanes));
                 nn[ni].string = laneToStr(newLane);
             }
         }
@@ -994,7 +1395,7 @@ function onDblClick(e) {
     const keysMode = isKeysMode();
     const laneBottom = keysMode
         ? WAVEFORM_H + pianoLaneCount() * PIANO_LANE_H
-        : WAVEFORM_H + LANES * LANE_H;
+        : WAVEFORM_H + lanes() * LANE_H;
     if (y < WAVEFORM_H || y > laneBottom) return;
 
     const idx = hitNote(x, y);
@@ -1037,7 +1438,7 @@ function onContextMenu(e) {
     // Right-click on beat bar or lanes with no note = section menu
     const beatBarY = isKeysMode()
         ? WAVEFORM_H + pianoLaneCount() * PIANO_LANE_H
-        : WAVEFORM_H + LANES * LANE_H;
+        : WAVEFORM_H + lanes() * LANE_H;
     if (y >= beatBarY || (y >= WAVEFORM_H && hitNote(x, y) < 0)) {
         showSectionMenu(e.clientX, e.clientY, xToTime(x));
         return;
@@ -1481,6 +1882,15 @@ async function loadCDLC(filename) {
         S.sessionId = data.session_id;
         S.format = data.format || 'psarc';
         S.arrangements = data.arrangements || [];
+        // Sloppak sources don't pad tuning to 6 slots like RS XML does,
+        // so a bass arrangement arriving with tuning.length === 6 from
+        // a sloppak is a genuine 6-string bass (not padded 4-string).
+        // Seed `_extendedStrings` so `_stringCountFor` doesn't fall
+        // back to the baseline-and-ignore-length-6 heuristic for these.
+        // Sloppak sources have authoritative tuning lengths (no RS
+        // padding). PSARC sources still get the `tuningLen > 6` path so
+        // a previously-extended-saved PSARC is detected on reload.
+        _seedExtendedStringsFromTuning(S.arrangements, S.format !== 'psarc');
         S.beats = data.beats || [];
         S.sections = data.sections || [];
         S.duration = data.duration || 0;
@@ -1558,6 +1968,19 @@ function updateArrangementSelector() {
     const keysBtn = document.getElementById('editor-add-keys-btn');
     if (keysBtn) {
         keysBtn.classList.toggle('hidden', !S.sessionId || S.format !== 'sloppak');
+    }
+
+    // Show "⋮ Strings" tuning editor whenever a guitar/bass arrangement is
+    // active (not Keys-mode — piano-roll arrangements have no string concept).
+    // Available on both PSARC and sloppak; the save-time prompt handles the
+    // format constraint if PSARC can't carry the result.
+    const stringsBtn = document.getElementById('editor-strings-btn');
+    if (stringsBtn) {
+        const active = S.arrangements[S.currentArr];
+        const stringsMode = !!active
+            && !KEYS_PATTERN.test(active.name || '')
+            && !/^drums/i.test(active.name || '');
+        stringsBtn.classList.toggle('hidden', !S.sessionId || !stringsMode);
     }
 
     // Show "● Record" (live MIDI) button on sloppak sessions only — PSARC's
@@ -1682,28 +2105,34 @@ function filterSongs(q) {
 // Save
 // ════════════════════════════════════════════════════════════════════
 
-async function saveCDLC() {
-    if (!S.sessionId) return;
-    // If a live MIDI take is in flight, finalize it first so its notes
-    // get committed into S.arrangements[_recArrIdx] before we serialize.
-    // Without this, Save mid-recording would persist the new Keys
-    // arrangement with notes: [] and discard the take.
-    if (_recState === 'recording') editorStopRecordMidi();
-    setStatus('Saving...');
+// True if the *active* arrangement has more strings than stock-RS
+// PSARC can carry (>6 guitar, >4 bass). PSARC saves are
+// per-arrangement (the /save endpoint only writes `arrangement_index`),
+// so checking other arrangements would surface the format prompt
+// even when the save would only touch a standard one — annoying for
+// users who, say, edited bass while leaving an extended lead alone.
+// Uses `_stringCountFor` which composes the explicit
+// `_extendedStrings` counter with chord-template width and max-note-
+// index signals (so a 5-string bass with no notes on the new lane
+// still trips the prompt, and a 6-string bass after a high-C add
+// does too because `_extendedStrings` is set).
+function _activeArrangementExceedsPsarcLimit() {
+    const a = S.arrangements[S.currentArr];
+    if (!a) return false;
+    const isBass = /bass/i.test(a.name || '');
+    const roleLimit = isBass ? 4 : 6;
+    return _stringCountFor(a) > roleLimit;
+}
 
-    // Sloppak save sends the full S.arrangements snapshot, so every
-    // arrangement (not just the active one) needs its chords reconstructed.
-    // Tab-switching only flattens the new currentArr — non-current
-    // arrangements may be in any of three states: never flattened
-    // (chords:[chord_groups], notes:[regular notes only]), flattened-and-
-    // -unreconstructed (chords:[], notes:[regular + flattened chord notes
-    // tagged with _fromChord]), or already round-tripped through both.
-    // Running flatten→reconstruct on every arrangement normalises them all:
-    // flatten is a no-op on already-flattened ones, and reconstruct rebuilds
-    // the chord groups by time. PSARC saves only emit S.currentArr so they
-    // keep the existing single-pass call.
+// Prep work common to all save paths: normalise chord state across
+// arrangements, then return the request body for the chosen endpoint.
+// `forceFullSnapshot` is true for save_as_sloppak so the new sloppak
+// gets every arrangement (not just S.currentArr).
+function _buildSaveBody(forceFullSnapshot) {
+    if (_recState === 'recording') editorStopRecordMidi();
+
     const savedArr = S.currentArr;
-    if (S.format === 'sloppak') {
+    if (S.format === 'sloppak' || forceFullSnapshot) {
         for (let i = 0; i < S.arrangements.length; i++) {
             S.currentArr = i;
             flattenChords();
@@ -1723,16 +2152,32 @@ async function saveCDLC() {
         chord_templates: arr.chord_templates,
         beats: S.beats,
         sections: S.sections,
-    };
-    // Sloppak: send the full arrangement snapshot so adds/reorders persist
-    // and the per-arrangement files all stay current.
-    if (S.format === 'sloppak') {
-        body.arrangements = S.arrangements;
-        body.metadata = {
+        // Always ship title/artist so PSARC saves persist in-session
+        // metadata edits too. Backend merges with session metadata
+        // (album/year captured at load time) so all four fields
+        // round-trip regardless of save path.
+        metadata: {
             title: S.title,
             artist: S.artist,
-        };
+        },
+    };
+    if (S.format === 'sloppak' || forceFullSnapshot) {
+        body.arrangements = S.arrangements;
     }
+    return body;
+}
+
+async function saveCDLC() {
+    if (!S.sessionId) return;
+    // PSARC can't carry >6-string guitar / >4-string bass. If the user
+    // pushed past those limits while editing, ask them whether to spill
+    // into a new .sloppak or accept the truncation before we touch disk.
+    if (S.format === 'psarc' && _activeArrangementExceedsPsarcLimit()) {
+        document.getElementById('editor-save-format-modal').classList.remove('hidden');
+        return;
+    }
+    setStatus('Saving...');
+    const body = _buildSaveBody(false);
     try {
         const resp = await fetch('/api/plugins/editor/save', {
             method: 'POST',
@@ -1745,11 +2190,99 @@ async function saveCDLC() {
     } catch (e) {
         setStatus('Save failed: ' + e.message);
     } finally {
-        // Re-flatten so editing continues with unified notes
         flattenChords();
         draw();
     }
 }
+
+window.editorHideSaveFormatModal = () => {
+    document.getElementById('editor-save-format-modal').classList.add('hidden');
+};
+
+// "Save as Sloppak" — POST the full arrangement snapshot to the new
+// /save_as_sloppak route. The backend writes a .sloppak next to the
+// source .psarc, then flips the session into sloppak mode so the next
+// regular Save uses the native sloppak path.
+window.editorSaveAsSloppakConfirm = async () => {
+    document.getElementById('editor-save-format-modal').classList.add('hidden');
+    if (!S.sessionId) return;
+    setStatus('Saving as Sloppak...');
+    const body = _buildSaveBody(true);
+    try {
+        const resp = await fetch('/api/plugins/editor/save_as_sloppak', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+        if (data.error) { setStatus('Save error: ' + data.error); return; }
+        // Flip session into sloppak mode so subsequent edits route to
+        // _save_sloppak. The original PSARC stays on disk untouched.
+        if (data.filename) S.filename = data.filename;
+        S.format = 'sloppak';
+        // Normalize in-memory tuning to the real string count so a
+        // subsequent /save (which now goes through the native sloppak
+        // path) doesn't serialize the RS-XML length-6 padding back into
+        // the sloppak manifest — a later reload would otherwise seed
+        // `_extendedStrings` from the padded length and mis-detect a
+        // 4-string bass as 6-string.
+        for (const arr of S.arrangements) {
+            _normalizeTuningToLanes(arr, _stringCountFor(arr));
+        }
+        // `updateArrangementSelector` is what owns the + Keys / Strings /
+        // Record toolbar gates and the remove-arrangement button. Refresh
+        // it immediately so the user sees sloppak-only controls light up
+        // the moment the conversion lands.
+        updateArrangementSelector();
+        // Prefer the relative filename over `data.path` so we don't
+        // leak absolute server filesystem paths into the status UI.
+        const displayName = data.filename || (data.path ? data.path.split('/').pop() : '');
+        setStatus('Saved as Sloppak: ' + displayName);
+    } catch (e) {
+        setStatus('Save failed: ' + e.message);
+    } finally {
+        flattenChords();
+        draw();
+    }
+};
+
+// "Save as PSARC (lose extra strings)" — fall back to the regular
+// /save route with `force_psarc_truncate: true`. The backend drops
+// notes on string ≥ 6 (or ≥ 4 for bass) and trims chord templates
+// before XML rebuild, so the resulting PSARC is internally consistent
+// and works in stock Rocksmith.
+window.editorSavePsarcTruncateConfirm = async () => {
+    document.getElementById('editor-save-format-modal').classList.add('hidden');
+    if (!S.sessionId) return;
+    setStatus('Saving (extra strings will be dropped)...');
+    const body = _buildSaveBody(false);
+    body.force_psarc_truncate = true;
+    // Ship `_extendedStrings` so the backend knows exactly how many
+    // extension columns to peel — independent of RS-XML padding
+    // ambiguity. A standard 4-string bass arrives with
+    // tuning.length==6 (padding) but _extendedStrings==0, so the
+    // backend correctly skips the peel even when another arrangement
+    // triggered the modal. The backend rebuilds <tuning> from the
+    // source XML's attrs (string0..string5), so we don't ship tuning
+    // separately.
+    const activeArr = S.arrangements[S.currentArr];
+    body._extendedStrings = activeArr ? (activeArr._extendedStrings || 0) : 0;
+    try {
+        const resp = await fetch('/api/plugins/editor/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+        if (data.error) { setStatus('Save error: ' + data.error); return; }
+        setStatus('Saved as PSARC (extra strings dropped)');
+    } catch (e) {
+        setStatus('Save failed: ' + e.message);
+    } finally {
+        flattenChords();
+        draw();
+    }
+};
 
 // ════════════════════════════════════════════════════════════════════
 // UI Helpers
@@ -1789,7 +2322,7 @@ function resizeCanvas() {
     const minBeat = 20, minWave = 50;
     BEAT_H = Math.max(minBeat, Math.floor(h * 0.05));
     WAVEFORM_H = Math.max(minWave, Math.floor(h * 0.12));
-    LANE_H = Math.max(30, Math.floor((h - WAVEFORM_H - BEAT_H) / LANES));
+    LANE_H = Math.max(30, Math.floor((h - WAVEFORM_H - BEAT_H) / lanes()));
 
     canvas.width = w * DPR;
     canvas.height = h * DPR;
@@ -2303,6 +2836,11 @@ window.editorDoCreate = async () => {
         S.sessionId = data.session_id;
         S.format = 'psarc';
         S.arrangements = data.arrangements || [];
+        // Create-mode (fresh GP import) — gp2rs builds tuning to the
+        // actual string count, so length 6 means a genuine 6-string
+        // bass / standard guitar (not RS-XML padding). Seed
+        // `_extendedStrings` to keep `_stringCountFor` honest.
+        _seedExtendedStringsFromTuning(S.arrangements, /* authoritative */ true);
         S.beats = data.beats || [];
         S.sections = data.sections || [];
         S.duration = data.duration || 0;
@@ -2355,6 +2893,19 @@ window.editorBuild = async () => {
         const arr = S.arrangements[i];
         allArrangements.push({
             name: arr.name,
+            // Ship tuning + capo so the backend's `_is_extended_range`
+            // tuning-length check fires for arrangements where the
+            // user extended via the Strings modal but hasn't placed
+            // notes on the new lanes yet. Without these the build
+            // would route to PSARC and then crash inside RsCli's SNG
+            // compiler when it sees the >6 tuning slots.
+            tuning: Array.isArray(arr.tuning) ? arr.tuning.slice() : [0, 0, 0, 0, 0, 0],
+            capo: arr.capo || 0,
+            // Explicit extension counter — required for the 6-string
+            // bass case where tuning.length==6 is ambiguous between
+            // RS-padded 4-string and genuine 6-string. Backend's
+            // `_is_extended_range` consumes this signal too.
+            _extendedStrings: arr._extendedStrings || 0,
             notes: arr.notes,
             chords: arr.chords,
             chord_templates: arr.chord_templates,
@@ -2744,6 +3295,166 @@ window.editorDoAddDrums = async () => {
         statusEl.textContent = 'Failed: ' + e.message;
         goBtn.disabled = false;
     }
+};
+
+// ════════════════════════════════════════════════════════════════════
+// Strings (tuning) editor — add/remove strings on the active arrangement
+// ════════════════════════════════════════════════════════════════════
+
+// Range per role. Bass extends low-then-high (4 → 5 add low B → 6 add high
+// C); guitar extends low-only (6 → 7 low B → 8 low F#).
+function _stringsRangeForActive() {
+    const arr = S.arrangements[S.currentArr];
+    const isBass = arr && /bass/i.test(arr.name || '');
+    return isBass
+        ? { min: 4, max: 6, defaultPos: 'low' }
+        : { min: 6, max: 8, defaultPos: 'low' };
+}
+
+function _nextAddPosition(arr, isBass) {
+    // Use `_stringCountFor(arr)` so the result is anchored to the
+    // passed arrangement (not whichever one is currently visible).
+    // It already disambiguates RS-XML padding from a genuine
+    // extended count — without that, a 4-string bass with padded
+    // length-6 tuning would be treated as "5→6 high-C add" instead
+    // of the expected "4→5 low-B".
+    const cur = _stringCountFor(arr);
+    if (isBass && cur === 5) return 'high';  // 5→6 bass adds high C
+    return 'low';
+}
+
+function _notesOnString(arr, idx) {
+    let count = 0;
+    for (const n of arr.notes || []) if (n.string === idx) count += 1;
+    for (const ch of arr.chords || []) {
+        for (const cn of ch.notes || []) if (cn.string === idx) count += 1;
+    }
+    return count;
+}
+
+function _renderStringsModal() {
+    const arr = S.arrangements[S.currentArr];
+    if (!arr) return;
+    const labels = laneLabels();           // low → high, length === lanes()
+    // Normalize the display tuning to the real string count so we don't
+    // surface RS-XML padding zeros as if they were real strings.
+    const tuning = (arr.tuning || []).slice(0, labels.length);
+    while (tuning.length < labels.length) tuning.push(0);
+    const { min, max } = _stringsRangeForActive();
+    const isBass = /bass/i.test(arr.name || '');
+
+    const summary = document.getElementById('editor-strings-summary');
+    if (summary) {
+        summary.textContent = `${arr.name || 'Arrangement'} — ${labels.length} string${labels.length === 1 ? '' : 's'} (${isBass ? 'bass' : 'guitar'}; range ${min}–${max})`;
+    }
+
+    const list = document.getElementById('editor-strings-list');
+    if (list) {
+        // Build rows with createElement / textContent rather than
+        // innerHTML — `tuning[i]` arrives from imported/edited JSON
+        // and could be non-numeric, so interpolating it raw would
+        // open a DOM-injection vector. Coercing to Number defends
+        // both against bad input AND against future code that may
+        // surface `lbl` values that aren't already HTML-safe.
+        // Display low → high so it reads naturally; `tuning` is also
+        // low → high in RS XML order, so iterating tuning matches.
+        list.textContent = '';
+        for (let i = 0; i < labels.length; i++) {
+            const lbl = labels[i];
+            const rawOff = tuning[i];
+            const off = Number.isFinite(Number(rawOff)) ? Number(rawOff) : 0;
+            const offTxt = off === 0 ? '0' : (off > 0 ? `+${off}` : `${off}`);
+            const row = document.createElement('div');
+            row.className = 'flex justify-between bg-dark-800 rounded px-2 py-1';
+            const left = document.createElement('span');
+            left.textContent = `String ${i} (${lbl})`;
+            const right = document.createElement('span');
+            right.className = 'text-gray-500';
+            right.textContent = `${offTxt} st`;
+            row.appendChild(left);
+            row.appendChild(right);
+            list.appendChild(row);
+        }
+    }
+
+    const addBtn = document.getElementById('editor-strings-add');
+    const removeBtn = document.getElementById('editor-strings-remove');
+    const warn = document.getElementById('editor-strings-warning');
+    const curCount = labels.length;  // === lanes()
+    if (addBtn) addBtn.disabled = curCount >= max;
+    if (removeBtn) {
+        // Only the most-recently-added low/high string is removable, and
+        // only if no notes live on it. For 6-bass, that's the high C
+        // (last index). For everything else it's the low extension
+        // (index 0). We mirror the add-position logic.
+        const pos = curCount === 6 && isBass ? 'high' : 'low';
+        const targetIdx = pos === 'low' ? 0 : curCount - 1;
+        const blockers = _notesOnString(arr, targetIdx);
+        const atFloor = curCount <= min;
+        removeBtn.disabled = atFloor || blockers > 0;
+        if (warn) {
+            if (atFloor) {
+                warn.textContent = `Already at the minimum ${min} strings.`;
+            } else if (blockers > 0) {
+                warn.textContent = `${blockers} note${blockers === 1 ? '' : 's'} on string ${targetIdx} — delete or move them before removing.`;
+            } else {
+                warn.textContent = '';
+            }
+        }
+    }
+}
+
+window.editorShowStringsModal = () => {
+    const arr = S.arrangements[S.currentArr];
+    if (!arr) return;
+    if (KEYS_PATTERN.test(arr.name || '') || /^drums/i.test(arr.name || '')) return;
+    document.getElementById('editor-strings-modal').classList.remove('hidden');
+    _renderStringsModal();
+};
+
+window.editorHideStringsModal = () => {
+    document.getElementById('editor-strings-modal').classList.add('hidden');
+};
+
+window.editorAddString = () => {
+    const arr = S.arrangements[S.currentArr];
+    if (!arr) return;
+    const isBass = /bass/i.test(arr.name || '');
+    const { max } = _stringsRangeForActive();
+    // Compute the count directly from the active arrangement rather
+    // than going through `lanes()` — the latter consults a per-draw
+    // cache and our intent here is explicitly "what is this
+    // arrangement's current string count?", independent of draw state.
+    if (_stringCountFor(arr) >= max) return;
+    const pos = _nextAddPosition(arr, isBass);
+    // The command's exec() calls _resizeForLaneChange() itself, which
+    // covers undo/redo too — no need to duplicate the resize here.
+    S.history.exec(new AddStringCmd(S.currentArr, pos));
+    _renderStringsModal();
+    draw();
+    updateStatus();
+};
+
+window.editorRemoveString = () => {
+    const arr = S.arrangements[S.currentArr];
+    if (!arr) return;
+    const isBass = /bass/i.test(arr.name || '');
+    const { min } = _stringsRangeForActive();
+    // Same reasoning as editorAddString — anchor on `arr` directly
+    // rather than the cached `lanes()`.
+    const cur = _stringCountFor(arr);
+    if (cur <= min) return;
+    // Mirror the position logic from add: 6-bass removes high (last),
+    // everything else removes the low extension (index 0).
+    const pos = cur === 6 && isBass ? 'high' : 'low';
+    const targetIdx = pos === 'low' ? 0 : cur - 1;
+    if (_notesOnString(arr, targetIdx) > 0) return;  // UI button is disabled too
+    // The command's exec() handles the resize internally (covers
+    // undo/redo too); see editorAddString.
+    S.history.exec(new RemoveStringCmd(S.currentArr, pos));
+    _renderStringsModal();
+    draw();
+    updateStatus();
 };
 
 // ════════════════════════════════════════════════════════════════════

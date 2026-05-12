@@ -21,6 +21,12 @@ from fastapi.responses import FileResponse, JSONResponse
 import yaml
 
 
+# Matches a plausible 4-digit album year inside free-form text — used to
+# sanitize <albumYear> when it has been polluted by copyright strings from
+# GP imports (RsCli parses albumYear as Int32 and rejects anything else).
+_YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
+
+
 _sessions = None
 
 
@@ -131,6 +137,92 @@ def setup(app, context):
             i += 1
         used.add(aid)
         return aid
+
+    def _normalize_tuning_to_count(tuning, real_count: int) -> list:
+        """Slice/pad a tuning list to exactly `real_count` entries.
+
+        Trailing zeros (RS-XML schema padding) are dropped first.
+        Callers should pass a `real_count` that already accounts for
+        any genuine extended-range offsets (via
+        `_arrangement_string_count`), so the final hard slice only
+        ever trims zeros — if a non-zero high-index offset survives
+        that, it really is being truncated (treat as a caller bug
+        rather than silently preserving and breaking the length
+        contract).
+        """
+        out = list(tuning) if isinstance(tuning, list) else []
+        if len(out) > real_count:
+            # Drop trailing zeros until we hit `real_count` or a non-zero.
+            while len(out) > real_count and out[-1] == 0:
+                out.pop()
+            if len(out) > real_count:
+                out = out[:real_count]
+        while len(out) < real_count:
+            out.append(0)
+        return out
+
+    def _safe_string_index(v) -> int | None:
+        """Coerce a note's `string` field to int. Returns None for
+        non-numeric / null values rather than raising — older client
+        payloads or corrupted manifests can ship `string: null` or
+        unexpected types, and we'd rather skip those entries than
+        500 the entire save/build."""
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _arrangement_string_count(arr) -> int:
+        """Mirror of screen.js `_stringCountFor` — composes the same
+        signals so backend writes a tuning slice that round-trips the
+        editor's in-memory string count."""
+        is_bass = "bass" in (arr.get("name", "") or "").lower()
+        baseline = 4 if is_bass else 6
+        try:
+            ext = int(arr.get("_extendedStrings", 0) or 0)
+        except (TypeError, ValueError):
+            ext = 0
+        n = baseline + max(0, ext)
+        tuning = arr.get("tuning")
+        if isinstance(tuning, list) and len(tuning) != 6:
+            n = max(n, len(tuning))
+        # Chord-template signal — count the highest *used* fret slot
+        # (last non(-1) index) so RS-XML's unconditional length-6
+        # frets array doesn't inflate the count for normal 4-string
+        # bass arrangements.
+        for ct in arr.get("chord_templates", []) or []:
+            frets = ct.get("frets")
+            if isinstance(frets, list):
+                for i in range(len(frets) - 1, -1, -1):
+                    if frets[i] != -1:
+                        if i + 1 > n:
+                            n = i + 1
+                        break
+        for note in arr.get("notes", []) or []:
+            s = _safe_string_index(note.get("string", 0))
+            if s is not None and s + 1 > n:
+                n = s + 1
+        for ch in arr.get("chords", []) or []:
+            for cn in ch.get("notes", []) or []:
+                s = _safe_string_index(cn.get("string", 0))
+                if s is not None and s + 1 > n:
+                    n = s + 1
+        return max(4, min(8, n))
+
+    def _is_extended_range(arr) -> bool:
+        """True if `arr` has more strings than stock-RS PSARC supports.
+
+        Delegates to `_arrangement_string_count` so all the same
+        signals (explicit `_extendedStrings` counter, tuning length,
+        chord-template highest-used-fret, max note string index) are
+        composed in one place. The earlier inline version missed
+        cases like a 5-string bass with tuning.length==5 — that
+        unambiguous extended-range signal wasn't covered by the
+        `len > 6` check.
+        """
+        is_bass = "bass" in (arr.get("name", "") or "").lower()
+        role_limit = 4 if is_bass else 6
+        return _arrangement_string_count(arr) > role_limit
 
     def _validate_editor_upload_path(path_str: str, prefix: str) -> Path | None:
         """Resolve a client-supplied upload path and constrain it to the
@@ -438,6 +530,15 @@ def setup(app, context):
             "xml_files": xml_files,
             "format": "sloppak" if is_sloppak else "psarc",
             "sloppak_state": sloppak_state,
+            # Stash song-level metadata so save_as_sloppak can carry
+            # album/year through to the generated manifest even though
+            # the frontend's currentSong state only tracks title/artist.
+            "metadata": {
+                "title": result.get("title", ""),
+                "artist": result.get("artist", ""),
+                "album": result.get("album", ""),
+                "year": result.get("year", ""),
+            },
             "last_touched": time.time(),
         }
         result["session_id"] = session_id
@@ -468,12 +569,139 @@ def setup(app, context):
         chord_templates = data.get("chord_templates", [])
         beats = data.get("beats", [])
         sections = data.get("sections", [])
-        metadata = data.get("metadata", {})
+        # Merge session metadata (album/year captured at PSARC load
+        # time) with anything the frontend sent. `_buildSaveBody` ships
+        # `{title, artist}` on every save path; this merge keeps the
+        # PSARC-only fields (album, year) that the frontend never
+        # round-trips, so they survive a save through this endpoint.
+        metadata = dict(session.get("metadata") or {})
+        metadata.update(data.get("metadata") or {})
 
         # Sloppak save can be a full snapshot of all arrangements (needed when
         # arrangements were added). If arrangements isn't provided, save_cdlc
         # only updates the single arrangement at arrangement_index.
         all_arrangements = data.get("arrangements")
+
+        # Explicit opt-in to lose extended-range data on a PSARC save.
+        # Set by the frontend when the user picked "Save as PSARC (lose
+        # extra strings)" in the format-prompt modal. No-op for sloppak
+        # (sloppak preserves extended range natively).
+        # Only honour `force_psarc_truncate` on PSARC-sourced sessions —
+        # sloppak handles extended range natively, and silently dropping
+        # data there because a buggy client / replayed request happened
+        # to include the flag would be surprising.
+        force_psarc_truncate = (
+            bool(data.get("force_psarc_truncate", False))
+            and session.get("format") == "psarc"
+        )
+        if force_psarc_truncate:
+            arr_name = ""
+            if all_arrangements and 0 <= arrangement_index < len(all_arrangements):
+                arr_name = all_arrangements[arrangement_index].get("name", "")
+            # PSARC saves typically don't ship `arrangements` (only sloppak
+            # / full-snapshot saves do), so fall back to reading the
+            # source XML's <arrangement> tag. Without this, bass charts
+            # were classified as guitar (max_string=5 instead of 3) and
+            # notes on string 4/5 slipped through.
+            if not arr_name:
+                xml_files = session.get("xml_files") or []
+                if 0 <= arrangement_index < len(xml_files):
+                    try:
+                        _xroot = ET.parse(xml_files[arrangement_index]).getroot()
+                        _atag = _xroot.find("arrangement")
+                        if _atag is not None and _atag.text:
+                            arr_name = _atag.text.strip()
+                    except (ET.ParseError, OSError):
+                        pass
+            is_bass = "bass" in arr_name.lower()
+            std_len = 4 if is_bass else 6
+            # Truncation has to reverse the AddStringCmd shift so the
+            # remaining notes stay on the right strings after the dropped
+            # extensions are gone. Mirror AddStringCmd's add-at-low (and
+            # 5→6-bass add-at-high) convention:
+            #   - guitar: extensions are always at the low end → drop
+            #     `extra_low` prefix and shift remaining notes by that
+            #     amount
+            #   - 5-string bass: low-B extension at index 0 → drop 1 from
+            #     the low end
+            #   - 6-string bass: BOTH low-B (idx 0) and high-C (last idx)
+            #     extensions → drop one from each end
+            # The frontend ships the explicit `_extendedStrings` counter
+            # so we know how many extras to peel even when tuning.length
+            # alone is ambiguous (the bass-padded-vs-real-6 case).
+            # Prefer the explicit `_extendedStrings` counter — it
+            # disambiguates the bass case where tuning.length==6
+            # could mean either a standard 4-string bass (RS-XML
+            # padding) or a genuine 6-string. Without it, a save
+            # where the user is on a *standard* bass tab while
+            # another arrangement is extended would catastrophically
+            # drop low-E notes thinking the bass was extended too.
+            try:
+                ext_strings = int(data.get("_extendedStrings", 0) or 0)
+            except (TypeError, ValueError):
+                ext_strings = 0
+            if ext_strings > 0:
+                cur_len = std_len + ext_strings
+            else:
+                # No extensions on this arrangement → nothing to peel.
+                cur_len = std_len
+            if is_bass:
+                # 5-string bass: low-B at idx 0. 6-string bass: low-B + high-C.
+                extra_low = 1 if cur_len >= 5 else 0
+                extra_high = 1 if cur_len >= 6 else 0
+            else:
+                extra_low = max(0, cur_len - std_len)
+                extra_high = 0
+            kept_min = extra_low
+            kept_max = cur_len - 1 - extra_high if cur_len > 0 else std_len - 1
+
+            def _shift_note(n):
+                # Drop notes whose `string` isn't numeric — same
+                # defensive coercion as `_arrangement_string_count` and
+                # `_is_extended_range`. A `string: null` from an older
+                # client / corrupted save shouldn't 500 the save.
+                s = _safe_string_index(n.get("string", 0))
+                if s is None or s < kept_min or s > kept_max:
+                    return None
+                new_n = dict(n)
+                new_n["string"] = s - extra_low
+                return new_n
+
+            new_notes = []
+            for n in notes:
+                shifted = _shift_note(n)
+                if shifted is not None:
+                    new_notes.append(shifted)
+            notes = new_notes
+
+            trimmed_chords = []
+            for ch in chords:
+                kept_cns = []
+                for cn in ch.get("notes", []) or []:
+                    shifted = _shift_note(cn)
+                    if shifted is not None:
+                        kept_cns.append(shifted)
+                if kept_cns:
+                    new_ch = dict(ch)
+                    new_ch["notes"] = kept_cns
+                    trimmed_chords.append(new_ch)
+            chords = trimmed_chords
+
+            # Chord templates: slice off the matching low / high columns.
+            for ct in chord_templates:
+                for key in ("frets", "fingers"):
+                    arr_v = ct.get(key)
+                    if isinstance(arr_v, list) and len(arr_v) > std_len:
+                        if extra_high:
+                            ct[key] = arr_v[extra_low: len(arr_v) - extra_high]
+                        else:
+                            ct[key] = arr_v[extra_low:]
+                        # Pad or clamp to exactly std_len so the XML
+                        # builder's max_i calc stays stable.
+                        if len(ct[key]) < std_len:
+                            ct[key] = ct[key] + [-1] * (std_len - len(ct[key]))
+                        elif len(ct[key]) > std_len:
+                            ct[key] = ct[key][:std_len]
 
         def _save_psarc():
             xml_files = session["xml_files"]
@@ -486,9 +714,15 @@ def setup(app, context):
             tree = ET.parse(xml_path)
             old_root = tree.getroot()
 
-            # Build new XML
+            # Build new XML. When force_psarc_truncate fires, cap the
+            # tuning width so a previously-saved extended-range XML
+            # can't sneak `string6+` into a stock-RS-targeted PSARC.
+            _force_max = None
+            if force_psarc_truncate:
+                _force_max = 4 if is_bass else 6
             xml_str = _build_arrangement_xml(
-                old_root, notes, chords, chord_templates, beats, sections, metadata
+                old_root, notes, chords, chord_templates, beats, sections, metadata,
+                force_max_strings=_force_max,
             )
 
             # Write XML
@@ -716,6 +950,134 @@ def setup(app, context):
             return JSONResponse({"error": str(e)}, 500)
 
         return {"success": True, "path": output}
+
+    # ── Save edited PSARC as Sloppak ──────────────────────────────────────
+    #
+    # When the user added extra strings (7/8-string guitar or 5/6-string
+    # bass) to a PSARC-sourced edit, the regular PSARC save path can't
+    # carry the extra strings — stock Rocksmith's SNG binary is hard-locked
+    # to 6/4. This endpoint writes a new `.sloppak` next to the original
+    # PSARC and updates the session so subsequent saves go through the
+    # native sloppak path. The PSARC stays on disk untouched.
+
+    @app.post("/api/plugins/editor/save_as_sloppak")
+    async def save_as_sloppak(data: dict):
+        session_id = data.get("session_id", "")
+        session = sessions.get(session_id)
+        if not session:
+            return JSONResponse({"error": "No active session"}, 400)
+        if session.get("format") != "psarc":
+            return JSONResponse(
+                {"error": "save_as_sloppak only applies to PSARC-sourced sessions"},
+                400,
+            )
+        session["last_touched"] = time.time()
+
+        arrangements_data = data.get("arrangements") or []
+        if not arrangements_data:
+            return JSONResponse({"error": "arrangements required"}, 400)
+        beats = data.get("beats", [])
+        sections = data.get("sections", [])
+        # Merge session metadata (loaded from the source PSARC: album,
+        # year, etc.) with anything the frontend sent (title/artist that
+        # the user may have edited mid-session). The frontend currently
+        # only ships `{title, artist}`, so without this merge `album` and
+        # `year` would be silently dropped when packaging the .sloppak.
+        meta = dict(session.get("metadata") or {})
+        meta.update(data.get("metadata") or {})
+
+        audio_file = session.get("audio_file") or ""
+        if not audio_file or not Path(audio_file).exists():
+            return JSONResponse({"error": "session has no audio file"}, 400)
+
+        dlc_dir = get_dlc_dir()
+        if not dlc_dir:
+            return JSONResponse({"error": "DLC folder not configured"}, 500)
+
+        source_filename = session["filename"]
+        source_path = (dlc_dir / source_filename).resolve()
+        try:
+            source_path.relative_to(dlc_dir.resolve())
+        except ValueError:
+            return JSONResponse({"error": "forbidden"}, 403)
+
+        # Output sits next to the source PSARC, sharing its stem so the
+        # library shows both `MySong_p.psarc` and `MySong_p.sloppak`.
+        # Keep any subdirectory prefix from `filename` (the picker
+        # supports nested layouts like `Artist/Song_p.psarc`); using
+        # just the bare stem here would put the sloppak in the right
+        # place on disk but `resolve_source_dir(new_filename, ...)`
+        # downstream would later look for it at the DLC root.
+        source_relpath = Path(source_filename)
+        new_filename = str(source_relpath.with_suffix(".sloppak").as_posix())
+        output_path = source_path.with_suffix(".sloppak")
+        # Refuse to write the zip on top of an authoring-form sloppak
+        # directory at the same path — the picker supports `.sloppak/`
+        # directories, and `_write_sloppak_pak` would fail trying to
+        # replace it. Better a clear 409 than a half-written conflict.
+        if output_path.exists() and output_path.is_dir():
+            return JSONResponse(
+                {"error": (
+                    f"A sloppak directory already exists at "
+                    f"{new_filename}. Remove or rename it before "
+                    "converting the PSARC."
+                )},
+                409,
+            )
+
+        def _do_save():
+            return _write_sloppak_pak(
+                audio_file=audio_file,
+                art_path="",  # PSARC sessions don't extract cover to disk yet
+                arrangements_data=arrangements_data,
+                beats=beats,
+                sections=sections,
+                meta=meta,
+                output_path=output_path,
+            )
+
+        def _do_save_and_repoint():
+            written = _do_save()
+            # Re-extract the just-written sloppak into a fresh working
+            # directory so the next /save call has a real sloppak source
+            # tree (`source_dir/arrangements/*.json`, `manifest.yaml`,
+            # stems) to edit. Without this, `_save_sloppak` would run
+            # against the PSARC unpacked dir with no manifest and emit a
+            # broken .sloppak on the user's next click of Save.
+            new_source_dir = sloppak_mod.resolve_source_dir(
+                new_filename, dlc_dir, SLOPPAK_CACHE,
+            )
+            new_manifest = sloppak_mod.load_manifest(Path(written))
+            return written, new_source_dir, new_manifest
+
+        try:
+            written, new_source_dir, new_manifest = (
+                await asyncio.get_event_loop().run_in_executor(None, _do_save_and_repoint)
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, 500)
+
+        # Switch session into sloppak mode pointing at the new sloppak's
+        # unpacked cache dir. The old PSARC working dir is unreachable
+        # from the session dict after we repoint `session["dir"]`, so
+        # delete it now — without this, every PSARC→Sloppak conversion
+        # leaks a temp directory full of unpacked SNG/WEM/DDS bytes.
+        old_psarc_dir = session.get("dir")
+        session["filename"] = new_filename
+        session["format"] = "sloppak"
+        session["dir"] = str(new_source_dir)
+        session["sloppak_state"] = {"manifest": new_manifest, "form": "zip"}
+        if old_psarc_dir and old_psarc_dir != str(new_source_dir):
+            shutil.rmtree(old_psarc_dir, ignore_errors=True)
+
+        return {
+            "success": True,
+            "path": written,
+            "filename": new_filename,
+            "format": "sloppak",
+        }
 
     # ── Upload album art ───────────────────────────────────────────────
 
@@ -1528,7 +1890,14 @@ def setup(app, context):
 
     @app.post("/api/plugins/editor/build")
     async def build_cdlc_endpoint(data: dict):
-        """Build a complete CDLC .psarc from the current create-mode session."""
+        """Build a CDLC from the current create-mode session.
+
+        Writes a `.sloppak` when any arrangement uses extended-range strings
+        (7/8-string guitar or 5/6-string bass) — RS2014's SNG binary format
+        is hard-locked to 6/4 strings, so a regular PSARC build via RsCli
+        would crash inside `ConvertInstrumental.xmlToSng`. Falls back to the
+        normal PSARC build otherwise.
+        """
         from lib.cdlc_builder import build_cdlc
 
         session_id = data.get("session_id", "")
@@ -1540,9 +1909,17 @@ def setup(app, context):
         arrangements_data = data.get("arrangements", [])
         beats = data.get("beats", [])
         sections = data.get("sections", [])
-        meta = data.get("metadata", session.get("metadata", {}))
+        # Merge session metadata (album/year captured at convert-gp time)
+        # with anything the frontend sent (the build modal currently
+        # only ships {title, artist, artistName}). Without the merge,
+        # extended-range sloppak builds via _write_sloppak_pak would
+        # silently drop album/year fields the user typed during import.
+        meta = dict(session.get("metadata") or {})
+        meta.update(data.get("metadata") or {})
         audio_url = data.get("audio_url", "")
         art_path = data.get("art_path", "")
+
+        needs_sloppak = any(_is_extended_range(a) for a in arrangements_data)
 
         def _build():
             # Write each arrangement's data to its corresponding XML
@@ -1612,18 +1989,200 @@ def setup(app, context):
                 album_art_path=art_path if art_path and Path(art_path).exists() else "",
             )
 
-        try:
-            output_path = await asyncio.get_event_loop().run_in_executor(
-                None, _build
+        def _build_sloppak_extended():
+            """Build a .sloppak for extended-range charts (>6 guitar / >4 bass).
+
+            Output filename is derived from title/artist for create-mode
+            sessions (no existing source filename to preserve).
+            """
+            resolved = _resolve_storage_url(audio_url) if audio_url else None
+            audio_file = str(resolved) if resolved else ""
+            if not audio_file or not Path(audio_file).exists():
+                raise RuntimeError("No audio file available for build")
+
+            dlc_dir = get_dlc_dir()
+            if not dlc_dir:
+                raise RuntimeError("DLC folder not configured")
+
+            title = meta.get("title", "Untitled")
+            artist = meta.get("artistName") or meta.get("artist", "Unknown")
+            safe_t = re.sub(r'[<>:"/\\|?*]', '_', title)
+            safe_a = re.sub(r'[<>:"/\\|?*]', '_', artist)
+            output = dlc_dir / f"{safe_t}_{safe_a}_p.sloppak"
+            return _write_sloppak_pak(
+                audio_file=audio_file,
+                art_path=art_path if art_path and Path(art_path).exists() else "",
+                arrangements_data=arrangements_data,
+                beats=beats,
+                sections=sections,
+                meta=meta,
+                output_path=output,
             )
+
+        try:
+            target = _build_sloppak_extended if needs_sloppak else _build
+            output_path = await asyncio.get_event_loop().run_in_executor(
+                None, target
+            )
+        except IsADirectoryError as e:
+            # _write_sloppak_pak refused to clobber an authoring-form
+            # sloppak directory at the target path. Surface as 409 so
+            # the UI can prompt the user to remove/rename it.
+            return JSONResponse({"error": str(e)}, 409)
         except Exception as e:
             import traceback
             traceback.print_exc()
             return JSONResponse({"error": str(e)}, 500)
 
-        return {"success": True, "path": output_path}
+        return {
+            "success": True,
+            "path": output_path,
+            "format": "sloppak" if needs_sloppak else "psarc",
+        }
 
     # ── Helpers ──────────────────────────────────────────────────────────
+
+    def _write_sloppak_pak(*, audio_file: str, art_path: str,
+                          arrangements_data: list, beats: list, sections: list,
+                          meta: dict, output_path: Path) -> str:
+        """Stage a sloppak at `output_path` from the in-memory edit state.
+
+        Shared between the create-mode build path (output_path derived
+        from title/artist) and the save-as-sloppak path (output_path
+        derived from the source PSARC filename, so the new sloppak sits
+        next to the original on disk).
+        """
+        if not audio_file or not Path(audio_file).exists():
+            raise RuntimeError("No audio file available for sloppak write")
+        # Sloppak supports a packed-zip form (foo.sloppak file) and an
+        # authoring directory form (foo.sloppak/ tree). Replacing a
+        # directory with a zip via tmp_zip.replace(...) would raise
+        # mid-operation and surface as a 500. Refuse early with a clear
+        # signal so callers can convert it into a 409.
+        if output_path.exists() and output_path.is_dir():
+            raise IsADirectoryError(
+                f"Refusing to overwrite authoring-form sloppak directory at {output_path}"
+            )
+
+        title = meta.get("title", "Untitled")
+        artist = meta.get("artistName") or meta.get("artist", "Unknown")
+        album = meta.get("albumName") or meta.get("album", "")
+        year_raw = str(meta.get("albumYear") or meta.get("year", ""))
+        ym = _YEAR_RE.search(year_raw) if year_raw else None
+        year = int(ym.group(1)) if ym else 0
+
+        staging = Path(tempfile.mkdtemp(prefix="slopsmith_sloppak_build_"))
+        try:
+            arr_dir = staging / "arrangements"
+            arr_dir.mkdir()
+            stems_dir = staging / "stems"
+            stems_dir.mkdir()
+
+            # Single combined-audio stem — the editor only carries one
+            # audio source per session (PSARC load decodes the WEM to a
+            # single ogg; create-mode imports one audio file).
+            audio_ext = Path(audio_file).suffix.lower() or ".ogg"
+            stem_filename = f"audio{audio_ext}"
+            shutil.copy2(audio_file, stems_dir / stem_filename)
+
+            used_ids: set[str] = set()
+            manifest_arrangements = []
+            duration = 0.0
+            for b in beats:
+                try:
+                    duration = max(duration, float(b.get("time", 0)))
+                except (TypeError, ValueError):
+                    pass
+
+            for i, ad in enumerate(arrangements_data):
+                name = ad.get("name", f"Arr{i}")
+                # `_arrangement_id` already inserts into `used_ids` for us.
+                aid = _arrangement_id(name, used_ids)
+                # Normalize tuning to the real string count so the
+                # written sloppak unambiguously reflects the editor's
+                # in-memory count (the RS-XML 6-slot padding does NOT
+                # round-trip through sloppak — we want length 4 for a
+                # real 4-string bass, length 6 for a genuine 6-string).
+                real_count = _arrangement_string_count(ad)
+                normalized_tuning = _normalize_tuning_to_count(
+                    ad.get("tuning", [0] * 6), real_count,
+                )
+                wire = _arr_dict_to_wire(
+                    name,
+                    normalized_tuning,
+                    int(ad.get("capo", 0)),
+                    ad.get("notes", []),
+                    ad.get("chords", []),
+                    ad.get("chord_templates", []),
+                )
+                if i == 0:
+                    wire["beats"] = [
+                        {"time": round(float(b.get("time", 0)), 3),
+                         "measure": int(b.get("measure", -1))}
+                        for b in beats
+                    ]
+                    wire["sections"] = [
+                        {"name": s.get("name", ""),
+                         "number": int(s.get("number", 0)),
+                         "time": round(float(s.get("start_time", 0)), 3)}
+                        for s in sections
+                    ]
+                (arr_dir / f"{aid}.json").write_text(
+                    json.dumps(wire, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                manifest_arrangements.append({
+                    "id": aid,
+                    "name": name,
+                    "file": f"arrangements/{aid}.json",
+                    "tuning": normalized_tuning,
+                    "capo": int(ad.get("capo", 0)),
+                })
+
+            manifest = {
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "duration": round(duration, 3),
+                # `id: "full"` matches the convention the editor's load
+                # path and replace-audio path already use; sloppak
+                # readers prefer that id when picking the default stem.
+                "stems": [
+                    {"id": "full", "file": f"stems/{stem_filename}"},
+                ],
+                "arrangements": manifest_arrangements,
+            }
+            if year:
+                manifest["year"] = year
+
+            if art_path and Path(art_path).exists():
+                cover_ext = Path(art_path).suffix.lower() or ".jpg"
+                cover_name = f"cover{cover_ext}"
+                shutil.copy2(art_path, staging / cover_name)
+                manifest["cover"] = cover_name
+
+            (staging / "manifest.yaml").write_text(
+                yaml.safe_dump(manifest, sort_keys=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            # Match the existing /save paths: keep a one-time .bak when
+            # we're about to overwrite an existing sloppak so the user
+            # has a recovery point.
+            if output_path.exists() and output_path.is_file():
+                backup = output_path.with_suffix(output_path.suffix + ".bak")
+                if not backup.exists():
+                    shutil.copy2(output_path, backup)
+            tmp_zip = output_path.with_suffix(output_path.suffix + ".tmp")
+            with zipfile.ZipFile(str(tmp_zip), "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in staging.rglob("*"):
+                    if f.is_file():
+                        zf.write(f, f.relative_to(staging).as_posix())
+            tmp_zip.replace(output_path)
+            return str(output_path)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
     def _arr_dict_to_wire(name, tuning, capo, notes, chords, chord_templates):
         """Convert editor's long-named arrangement dict into sloppak wire format.
@@ -1785,15 +2344,49 @@ def setup(app, context):
         return result
 
     def _build_arrangement_xml(
-        old_root, notes, chords, chord_templates, beats, sections, metadata
+        old_root, notes, chords, chord_templates, beats, sections, metadata,
+        force_max_strings=None,
     ):
-        """Build a Rocksmith arrangement XML from editor data."""
+        """Build a Rocksmith arrangement XML from editor data.
+
+        `force_max_strings` caps the emitted `<tuning>` width so a
+        PSARC truncate save can't carry over `string6+` slots that may
+        have been written by a prior extended-range save — without
+        this, RsCli's SNG compiler would still crash on the saved
+        PSARC even though we trimmed notes/chords/templates first.
+        """
         root = ET.Element("song", version="7")
 
-        # Preserve metadata from original XML, override with editor metadata
+        # Friendly key aliases the editor uses in its session metadata, mapped
+        # onto the RS XML tag names. Lets convert-gp's `{title, artist, album,
+        # year}` payload override the original XML even though the XML uses
+        # `albumName` / `albumYear` / `artistName`.
+        _META_ALIASES = {
+            "title": ("title",),
+            "artistName": ("artistName", "artist"),
+            "albumName": ("albumName", "album"),
+            "albumYear": ("albumYear", "year"),
+            "arrangement": ("arrangement",),
+            "offset": ("offset",),
+            "songLength": ("songLength",),
+            "startBeat": ("startBeat",),
+            "averageTempo": ("averageTempo",),
+        }
+
         def _text(tag, fallback=""):
+            for k in _META_ALIASES.get(tag, (tag,)):
+                if k in metadata and metadata[k] not in (None, ""):
+                    return str(metadata[k])
             el = old_root.find(tag)
-            return metadata.get(tag, el.text if el is not None and el.text else fallback)
+            return el.text if el is not None and el.text else fallback
+
+        # albumYear must parse as Int32 for RsCli; sanitize away any stray
+        # copyright text that earlier conversions may have written into the
+        # XML, and clamp non-numeric values to empty.
+        def _year_text():
+            raw = _text("albumYear", "")
+            m = _YEAR_RE.search(raw) if raw else None
+            return m.group(1) if m else ""
 
         ET.SubElement(root, "title").text = _text("title", "Untitled")
         ET.SubElement(root, "arrangement").text = _text("arrangement", "Lead")
@@ -1803,12 +2396,29 @@ def setup(app, context):
         ET.SubElement(root, "averageTempo").text = _text("averageTempo", "120")
         ET.SubElement(root, "artistName").text = _text("artistName", "Unknown")
         ET.SubElement(root, "albumName").text = _text("albumName", "")
-        ET.SubElement(root, "albumYear").text = _text("albumYear", "")
+        ET.SubElement(root, "albumYear").text = _year_text()
 
-        # Tuning — preserve from original
+        # Tuning — preserve from original. RS schema names string0..string5;
+        # extended-range arrangements (7/8-string guitar imported from GP)
+        # carry string6/string7 too, so copy whatever the source XML had.
         old_tuning = old_root.find("tuning")
         tuning_el = ET.SubElement(root, "tuning")
-        for i in range(6):
+        max_i = 5
+        if old_tuning is not None:
+            i = 6
+            while old_tuning.get(f"string{i}") is not None:
+                max_i = i
+                i += 1
+        # PSARC truncate path passes force_max_strings so a previously
+        # extended-range source XML can't carry over string6+ even
+        # though we trimmed notes/chords/templates. Always emit at
+        # least string0..string5 — RS XML schema requires those six
+        # slots regardless of role (a 4-string bass writes the upper
+        # two as 0), and dropping them breaks RsCli / downstream
+        # parsers that assume they exist.
+        if force_max_strings is not None:
+            max_i = max(5, min(max_i, force_max_strings - 1))
+        for i in range(max_i + 1):
             val = "0"
             if old_tuning is not None:
                 val = old_tuning.get(f"string{i}", "0")
@@ -1860,11 +2470,26 @@ def setup(app, context):
         ct_el = ET.SubElement(
             root, "chordTemplates", count=str(len(chord_templates))
         )
+        # Use the max of both `frets` and `fingers` lengths so a
+        # template that has a wider fingers array than frets doesn't
+        # silently drop the extra `fingerN` slots on round-trip.
+        # Clamp to the extended-range ceiling (string0..string7 i.e.
+        # 8-string guitar) so a malformed payload can't blow up the
+        # emitted XML — `force_max_strings` is set by the truncate
+        # path; otherwise use 8 as a hard upper bound matching the
+        # editor's MAX_LANES.
+        _CT_HARD_CAP = force_max_strings if force_max_strings is not None else 8
+        ct_width = max(
+            6,
+            max((len(ct.get("frets", [])) for ct in chord_templates), default=6),
+            max((len(ct.get("fingers", [])) for ct in chord_templates), default=6),
+        )
+        ct_width = min(ct_width, _CT_HARD_CAP)
         for ct in chord_templates:
             attrs = {"chordName": ct.get("name", "")}
-            frets = ct.get("frets", [-1] * 6)
-            fingers = ct.get("fingers", [-1] * 6)
-            for i in range(6):
+            frets = ct.get("frets", [-1] * ct_width)
+            fingers = ct.get("fingers", [-1] * ct_width)
+            for i in range(ct_width):
                 attrs[f"fret{i}"] = str(frets[i] if i < len(frets) else -1)
                 attrs[f"finger{i}"] = str(fingers[i] if i < len(fingers) else -1)
             ET.SubElement(ct_el, "chordTemplate", **attrs)
