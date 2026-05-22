@@ -75,6 +75,20 @@ const S = {
     currentArr: 0,
     beats: [], sections: [], duration: 0, offset: 0,
 
+    // Drum tab — null until the user adds drums via the +Drums modal, then
+    // a dict matching docs/sloppak-spec.md §5.3 ({version,name,kit,hits}).
+    // Persisted via _buildSaveBody as the `drum_tab` field on the save body.
+    drumTab: null,
+    // True once the user imports or edits the drum tab this session.
+    // _buildSaveBody only ships `drum_tab` when this is set, so a tab
+    // merely loaded from disk doesn't get re-persisted on every save.
+    drumTabDirty: false,
+    // Drum editor mode — when true, the editor canvas swaps to a piece-lane
+    // grid view of S.drumTab.hits[]. drumSel is the set of selected hit
+    // indices. Both reset whenever the user loads a different sloppak.
+    drumEditMode: false,
+    drumSel: new Set(),
+
     // View
     scrollX: 0,   // seconds
     zoom: 120,     // px per second
@@ -419,6 +433,16 @@ function draw() {
     ctx.save();
     ctx.scale(DPR, DPR);
     ctx.clearRect(0, 0, w, h);
+
+    // Drum editor mode forks the canvas to a piece-lane grid view. The
+    // guitar/keys draw chain below is skipped entirely so its lane-cache
+    // logic doesn't try to walk a non-existent arrangement (`S.drumTab`
+    // is not in S.arrangements[]).
+    if (S.drumEditMode && S.drumTab) {
+        try { _drumEditorDraw(w, h); }
+        finally { ctx.restore(); }
+        return;
+    }
 
     // Seed the per-frame `lanes()` cache. drawNotes calls strToLane on every
     // note (and per-note hit tests do the same), so without this every
@@ -1156,6 +1180,15 @@ function onMouseDown(e) {
     // Right button = context menu (handled in onContextMenu)
     if (e.button === 2) return;
 
+    // Drum-edit mode hijacks the left click so the lane-grid editor can
+    // add/remove/select hits without going through the guitar-arrangement
+    // click pipeline below (which would crash on a missing
+    // S.arrangements[currentArr]).
+    if (S.drumEditMode && S.drumTab) {
+        _drumEditorOnMouseDown(e, x, y);
+        return;
+    }
+
     // Left button
     if (y < WAVEFORM_H) {
         // Block waveform seek while recording: restarting the AudioBufferSourceNode
@@ -1260,6 +1293,12 @@ function _onMouseMoveBody(e, x, y, L) {
 
     // Cursor hint when not dragging
     if (!S.drag) {
+        // In drum-edit mode the guitar/keys hover logic (hitNoteEdge) is
+        // irrelevant and shows misleading resize cursors over the drum grid.
+        if (S.drumEditMode && S.drumTab) {
+            if (canvas) canvas.style.cursor = '';
+            return;
+        }
         if (canvas && y >= WAVEFORM_H && y < WAVEFORM_H + L * LANE_H) {
             canvas.style.cursor = hitNoteEdge(x, y) >= 0 ? 'ew-resize' : '';
         } else if (canvas) {
@@ -1271,6 +1310,13 @@ function _onMouseMoveBody(e, x, y, L) {
     if (S.drag.type === 'pan') {
         const dx = x - S.drag.startX;
         S.scrollX = Math.max(0, S.drag.origScroll - dx / S.zoom);
+        draw();
+        return;
+    }
+
+    // Drum-edit drag: move every selected hit in time and lane in lockstep.
+    if (S.drag.type === 'drum-move') {
+        _drumEditorOnDragMove(x, y);
         draw();
         return;
     }
@@ -1332,6 +1378,14 @@ function onMouseUp(e) {
     if (!S.drag) return;
     const { x, y } = getMousePos(e);
 
+    // Drum-edit drag finalise: sort hits, remap selection indices, clear
+    // S.drag. No undo command — out of scope for the initial drum editor
+    // PR (would need a DrumMoveCmd that captures origTimes/origPieces).
+    if (S.drag.type === 'drum-move') {
+        _drumEditorOnDragEnd();
+        return;
+    }
+
     if (S.drag.type === 'resize') {
         const nn = notes();
         const finalSustain = nn[S.drag.noteIdx].sustain;
@@ -1390,6 +1444,7 @@ function onMouseUp(e) {
 }
 
 function onDblClick(e) {
+    if (S.drumEditMode) return;  // drum-edit mode handles all canvas interaction
     if (_recState === 'recording') return;  // block note addition during active take
     const { x, y } = getMousePos(e);
     const keysMode = isKeysMode();
@@ -1432,6 +1487,7 @@ function onWheel(e) {
 }
 
 function onContextMenu(e) {
+    if (S.drumEditMode) { e.preventDefault(); return; }  // drum-edit mode handles interaction
     e.preventDefault();
     const { x, y } = getMousePos(e);
 
@@ -1512,11 +1568,41 @@ function onKeyDown(e) {
     if (_recState === 'recording') return;
 
     if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (S.sel.size && !e.target.matches('input, select, textarea')) {
+        // Drum-edit mode: delete selected drum hits in place. No undo
+        // (would need a sibling DrumEditCmd class — out of scope for this PR).
+        // Guard against focus being inside a form control (mirrors the note-
+        // delete path below) so typing in a text input doesn't delete hits.
+        if (S.drumEditMode && S.drumSel.size && S.drumTab &&
+                !e.target.matches('input, select, textarea')) {
+            e.preventDefault();
+            _drumEditorDeleteSelection();
+            draw();
+            return;
+        }
+        // Guard: in drum-edit mode S.sel may still hold a prior guitar/keys
+        // selection from before mode entry; deleting those notes while the
+        // user thinks they're editing drums would be surprising. Only run
+        // the guitar/keys delete path when drum-edit mode is inactive.
+        if (!S.drumEditMode && S.sel.size && !e.target.matches('input, select, textarea')) {
             e.preventDefault();
             S.history.exec(new DeleteNotesCmd([...S.sel]));
             draw();
             updateStatus();
+            return;
+        }
+    }
+    // Drum-edit articulation toggles — only when one or more hits are
+    // selected. G = ghost, F = flam, K = choke (cymbal pieces only, ignored
+    // on drums). Plain key (no Shift/Ctrl/Meta/Alt modifiers) so they don't
+    // fight Ctrl+G, Shift+G, etc.
+    if (S.drumEditMode && S.drumSel.size && S.drumTab
+        && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey
+        && !e.target.matches('input, select, textarea')) {
+        const k = e.key.toLowerCase();
+        if (k === 'g' || k === 'f' || k === 'k') {
+            e.preventDefault();
+            _drumEditorToggleArticulation(k);
+            draw();
             return;
         }
     }
@@ -1534,6 +1620,15 @@ function onKeyDown(e) {
     if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
         if (!e.target.matches('input, select, textarea')) {
             e.preventDefault();
+            if (S.drumEditMode && S.drumTab) {
+                // Select every drum hit. No filter — the user wants every
+                // hit even off-screen, mirroring the guitar Ctrl+A path.
+                S.drumSel = new Set();
+                const hits = S.drumTab.hits || [];
+                for (let i = 0; i < hits.length; i++) S.drumSel.add(i);
+                draw();
+                return;
+            }
             const nn = notes();
             for (let i = 0; i < nn.length; i++) S.sel.add(i);
             draw();
@@ -1541,7 +1636,11 @@ function onKeyDown(e) {
         }
     }
     if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
-        if (S.sel.size && !e.target.matches('input, select, textarea')) {
+        // Copy/paste act on the guitar/keys arrangement's S.sel. In
+        // drum-edit mode the canvas shows the drum grid, so a paste here
+        // would mutate the hidden arrangement with no visual feedback —
+        // skip both shortcuts while drum-edit mode is active.
+        if (!S.drumEditMode && S.sel.size && !e.target.matches('input, select, textarea')) {
             e.preventDefault();
             const nn = notes();
             const selNotes = [...S.sel].map(i => nn[i]);
@@ -1561,7 +1660,7 @@ function onKeyDown(e) {
         }
     }
     if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
-        if (S.clipboard && S.clipboard.notes.length && !e.target.matches('input, select, textarea')) {
+        if (!S.drumEditMode && S.clipboard && S.clipboard.notes.length && !e.target.matches('input, select, textarea')) {
             e.preventDefault();
             const pasteTime = S.cursorTime;
             const newNotes = S.clipboard.notes.map(n => ({
@@ -1895,6 +1994,22 @@ async function loadCDLC(filename) {
         S.sections = data.sections || [];
         S.duration = data.duration || 0;
         S.offset = data.offset || 0;
+        // Drum tab is loaded server-side when the manifest carries a
+        // `drum_tab:` key and the file passes schema validation. Treat
+        // a missing/falsey value as "no drums" so the +Drums modal can
+        // tell whether the user is adding-or-replacing.
+        S.drumTab = data.drum_tab ?? null;
+        // Normalize hits: sort by t so drum-editor hit-testing and dragging
+        // work correctly even if drum_tab.json was saved out of order.
+        if (S.drumTab && Array.isArray(S.drumTab.hits)) {
+            S.drumTab.hits.sort((a, b) => (a.t || 0) - (b.t || 0));
+        }
+        // Freshly loaded from disk — not dirty until the user edits it.
+        S.drumTabDirty = false;
+        // Exit drum-edit mode on song change so we don't carry a stale
+        // selection into a sloppak whose hits[] is different.
+        S.drumEditMode = false;
+        S.drumSel = new Set();
         S.currentArr = 0;
         S.sel.clear();
         S.scrollX = 0;
@@ -1957,11 +2072,33 @@ function updateArrangementSelector() {
         sel.value = String(idx);
     }
 
-    // Show "+ Drums" button when a session is active and no drums arrangement exists
-    const hasDrums = S.arrangements.some(a => /^drums/i.test(a.name || ''));
+    // "+ Drums" button: shown on any active session — the modal lets the
+    // user add OR replace a drum tab. The old gate ("hide when a drums
+    // ARRANGEMENT exists") is obsolete now that drums live in their own
+    // `drum_tab.json` payload rather than the arrangements list. Legacy
+    // sloppaks that still carry a guitar-encoded "drums" arrangement also
+    // keep the button visible so the user can upgrade them to the new
+    // format.
     const drumsBtn = document.getElementById('editor-add-drums-btn');
     if (drumsBtn) {
-        drumsBtn.classList.toggle('hidden', !S.sessionId || hasDrums);
+        // Gate to sloppak sessions only — drum_tab.json is a sloppak-spec
+        // artefact and _save_psarc silently ignores the drum_tab payload,
+        // so showing the button on PSARC would mislead users into thinking
+        // drums will persist after save. Mirrors the +Keys button pattern.
+        drumsBtn.classList.toggle('hidden', !S.sessionId || S.format !== 'sloppak');
+        if (S.drumTab) {
+            const hitCount = (S.drumTab.hits || []).length;
+            const kitCount = (S.drumTab.kit || []).length;
+            drumsBtn.textContent = `⟳ Drums (${hitCount})`;
+            drumsBtn.title = `Drum tab present: ${hitCount} hits across ${kitCount} pieces — click to replace`;
+            drumsBtn.classList.remove('bg-red-900', 'hover:bg-red-800');
+            drumsBtn.classList.add('bg-green-900', 'hover:bg-green-800');
+        } else {
+            drumsBtn.textContent = '+ Drums';
+            drumsBtn.title = 'Import a drum tab from a Guitar Pro or MIDI file';
+            drumsBtn.classList.add('bg-red-900', 'hover:bg-red-800');
+            drumsBtn.classList.remove('bg-green-900', 'hover:bg-green-800');
+        }
     }
 
     // Show "+ Keys" button on sloppak sessions; multiple Keys arrangements are allowed.
@@ -2163,6 +2300,16 @@ function _buildSaveBody(forceFullSnapshot) {
     };
     if (S.format === 'sloppak' || forceFullSnapshot) {
         body.arrangements = S.arrangements;
+    }
+    // Drum-tab payload — separate from arrangements (see sloppak-spec §5.3).
+    // S.drumTab is null while the sloppak has none; after +Drums it holds the
+    // parsed JSON dict. Only ship `drum_tab` when the user actually
+    // imported / edited it this session (`S.drumTabDirty`) — a tab merely
+    // loaded from disk is left out so the backend's no-op path preserves
+    // the manifest entry unchanged instead of re-serialising the whole
+    // hit list on every unrelated save.
+    if (S.drumTabDirty && S.drumTab !== undefined && S.drumTab !== null) {
+        body.drum_tab = S.drumTab;
     }
     return body;
 }
@@ -3309,144 +3456,168 @@ window.editorRemoveArrangement = async () => {
 };
 
 // ════════════════════════════════════════════════════════════════════
-// Add Drums arrangement from GP file
+// Add Drums — drum_tab.json import from a GP or MIDI file.
+// Persists via _buildSaveBody's `drum_tab` field on the next save_cdlc.
 // ════════════════════════════════════════════════════════════════════
 
-let _addDrumsGpPath = null;
+// Buffered state from the upload phase: a successful parse stores the
+// server-side temp path + file kind here, then editorDoAddDrums commits.
+// Cleared on every modal-open and on every fresh file selection.
+let _addDrumsFile = null;  // { kind: 'gp' | 'midi', path: string }
 
 window.editorShowAddDrumsModal = () => {
-    _addDrumsGpPath = null;
+    _addDrumsFile = null;
     document.getElementById('editor-add-drums-modal').classList.remove('hidden');
     document.getElementById('editor-add-drums-tracks').classList.add('hidden');
     document.getElementById('editor-add-drums-go').disabled = true;
     document.getElementById('editor-add-drums-status').textContent = '';
     const fileInput = document.getElementById('editor-add-drums-gp');
     if (fileInput) fileInput.value = '';
+    // Show the "will replace" notice only when a drum_tab already lives on
+    // the sloppak so the user knows what's about to happen.
+    const existingEl = document.getElementById('editor-add-drums-existing');
+    if (existingEl) {
+        existingEl.classList.toggle('hidden', !S.drumTab);
+    }
 };
 
 window.editorHideAddDrumsModal = () => {
     document.getElementById('editor-add-drums-modal').classList.add('hidden');
 };
 
-window.editorDrumsGPSelected = async (input) => {
+// File-kind dispatcher — GP path lists tracks via /import-gp, MIDI path
+// via /import-drums-midi-list. Both eventually populate the same picker.
+window.editorDrumsFileSelected = async (input) => {
     const file = input.files[0];
     if (!file) return;
 
     const statusEl = document.getElementById('editor-add-drums-status');
-    statusEl.textContent = 'Parsing GP file...';
+    const goBtn = document.getElementById('editor-add-drums-go');
 
-    // Drop any state from a previous successful parse so a later parse
-    // failure (or empty-tracks result) can't be silently committed via
-    // editorDoAddDrums using the older file's path.
-    _addDrumsGpPath = null;
-    document.getElementById('editor-add-drums-go').disabled = true;
+    // Drop any prior successful parse so a later failure can't commit via
+    // the older file's path.
+    _addDrumsFile = null;
+    goBtn.disabled = true;
     document.getElementById('editor-add-drums-tracks').classList.add('hidden');
 
+    // Detect "no extension" explicitly — `split('.').pop()` on a dotless
+    // filename returns the whole name, which would otherwise surface a
+    // misleading "Unsupported file type: drums" message.
+    const dotIdx = file.name.lastIndexOf('.');
+    const ext = dotIdx >= 0 ? file.name.slice(dotIdx + 1).toLowerCase() : '';
+    const isMidi = (ext === 'mid' || ext === 'midi');
+    const isGp = ['gp', 'gp3', 'gp4', 'gp5', 'gpx'].includes(ext);
+    if (!isMidi && !isGp) {
+        statusEl.textContent = 'Unsupported file type (expected .gp* or .mid/.midi)';
+        return;
+    }
+
+    statusEl.textContent = isMidi ? 'Parsing MIDI file...' : 'Parsing GP file...';
     const formData = new FormData();
     formData.append('file', file);
 
     try {
-        const resp = await fetch('/api/plugins/editor/import-gp', {
-            method: 'POST',
-            body: formData,
-        });
+        const url = isMidi
+            ? '/api/plugins/editor/import-drums-midi-list'
+            : '/api/plugins/editor/import-gp';
+        const resp = await fetch(url, { method: 'POST', body: formData });
         const data = await resp.json();
         if (data.error) {
             statusEl.textContent = 'Error: ' + data.error;
             return;
         }
 
-        // Show only drum/percussion tracks (accept legacy is_percussion alias
-        // from older slopsmith server.py revisions).
+        // Both endpoints return `{tracks: [...]}` shaped the same way.
+        // GP returns every track and we filter to drum/percussion; MIDI
+        // returns channel-9 only so the filter is a no-op there.
         const tracks = data.tracks || [];
-        const drumTracks = tracks.filter(t => (t.is_drums || t.is_percussion) && t.notes > 0);
+        const drumTracks = isMidi
+            ? tracks
+            : tracks.filter(t => (t.is_drums || t.is_percussion) && t.notes > 0);
         if (drumTracks.length === 0) {
-            statusEl.textContent = 'No drum/percussion tracks found in this file.';
-            // Leave the cleared state from above in place — no usable
-            // tracks means editorDoAddDrums must remain disabled.
+            statusEl.textContent = isMidi
+                ? 'No drum (channel-10) tracks found in this MIDI file.'
+                : 'No drum/percussion tracks found in this GP file.';
             return;
         }
 
-        // Only commit the new state once we know there's a usable track set.
-        _addDrumsGpPath = data.gp_path;
+        const path = isMidi ? data.midi_path : data.gp_path;
+        _addDrumsFile = { kind: isMidi ? 'midi' : 'gp', path };
 
         const listEl = document.getElementById('editor-add-drums-track-list');
-        listEl.innerHTML = drumTracks.map(t => {
+        listEl.innerHTML = drumTracks.map((t, i) => {
             const safeName = _editorEscHtml(t.name);
+            const checked = i === 0 ? 'checked' : '';
             return `<label class="flex items-center gap-2 text-xs text-gray-300 py-0.5">
-                <input type="radio" name="drums-track" value="${t.index}" checked class="accent-red-500">
+                <input type="radio" name="drums-track" value="${Number.isFinite(Number(t.index)) ? Number(t.index) : 0}" ${checked} class="accent-red-500">
                 <span class="text-red-300">${safeName}</span>
                 <span class="text-gray-600">${Number(t.notes) || 0} notes</span>
             </label>`;
         }).join('');
         document.getElementById('editor-add-drums-tracks').classList.remove('hidden');
-        document.getElementById('editor-add-drums-go').disabled = false;
+        goBtn.disabled = false;
         statusEl.textContent = `Found ${drumTracks.length} drum track(s).`;
     } catch (e) {
         statusEl.textContent = 'Failed: ' + e.message;
     }
 };
 
+// Back-compat alias — the modal HTML used to call this; some test
+// scaffolds might still wire it up. Forwards to the new dispatcher.
+window.editorDrumsGPSelected = (input) => window.editorDrumsFileSelected(input);
+
 window.editorDoAddDrums = async () => {
-    if (!_addDrumsGpPath || !S.sessionId) return;
+    if (!_addDrumsFile || !S.sessionId) return;
 
     const statusEl = document.getElementById('editor-add-drums-status');
     const goBtn = document.getElementById('editor-add-drums-go');
     goBtn.disabled = true;
     statusEl.textContent = 'Importing drum track...';
 
-    // Get selected track index
     const radio = document.querySelector('input[name="drums-track"]:checked');
     const trackIndex = radio ? parseInt(radio.value) : 0;
 
     try {
-        // Import the drum track
-        const resp = await fetch('/api/plugins/editor/import-drums', {
+        const url = _addDrumsFile.kind === 'midi'
+            ? '/api/plugins/editor/import-drums-midi'
+            : '/api/plugins/editor/import-drums-tab';
+        const bodyKey = _addDrumsFile.kind === 'midi' ? 'midi_path' : 'gp_path';
+        const resp = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                gp_path: _addDrumsGpPath,
+                [bodyKey]: _addDrumsFile.path,
                 track_index: trackIndex,
                 audio_offset: _effectiveAudioOffset(),
             }),
         });
         const data = await resp.json();
-        if (data.error) {
-            statusEl.textContent = 'Error: ' + data.error;
+        if (data.error || !data.drum_tab) {
+            statusEl.textContent = 'Error: ' + (data.error || 'no drum_tab in response');
             goBtn.disabled = false;
             return;
         }
 
-        // Add to current session
-        const addResp = await fetch('/api/plugins/editor/add-arrangement', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                session_id: S.sessionId,
-                arrangement: data.arrangement,
-                xml_path: data.xml_path,
-            }),
-        });
-        const addResult = await addResp.json().catch(() => ({}));
-        if (!addResp.ok || addResult.error) {
-            statusEl.textContent = 'Error adding: ' + (addResult.error || addResp.status);
-            goBtn.disabled = false;
-            return;
+        // Stash on session state; the next save_cdlc ships it as
+        // `drum_tab` and the backend writes drum_tab.json + manifest key.
+        // Normalize hits: ensure sorted by t so drum-editor hit-testing and
+        // dragging work correctly, and clear any stale selection so indices
+        // from the old tab don't point into the new hits array.
+        S.drumTab = data.drum_tab;
+        if (S.drumTab && Array.isArray(S.drumTab.hits)) {
+            S.drumTab.hits.sort((a, b) => (a.t || 0) - (b.t || 0));
         }
-
-        // Add the arrangement to local state
-        S.arrangements.push(data.arrangement);
-        S.currentArr = S.arrangements.length - 1;
-        const sel = document.getElementById('editor-arrangement');
-        sel.value = S.currentArr;
-
-        flattenChords();
-        updateArrangementSelector();
-        updateStatus();
-        draw();
+        S.drumTabDirty = true;  // user-imported — persist on next save
+        S.drumSel = new Set();
 
         editorHideAddDrumsModal();
-        setStatus('Added Drums arrangement (' + data.arrangement.notes.length + ' notes)');
+        const hitCount = (data.drum_tab.hits || []).length;
+        setStatus(`Drum tab imported (${hitCount} hits) — save to persist`);
+        // Refresh the toolbar drum button (text/colour) and canvas so the
+        // user immediately sees the "⟳ Drums (N)" state without waiting for
+        // an unrelated redraw.
+        updateArrangementSelector();
+        draw();
     } catch (e) {
         statusEl.textContent = 'Failed: ' + e.message;
         goBtn.disabled = false;
@@ -4254,6 +4425,520 @@ function drawGhostNotes() {
     }
     ctx.restore();
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Drum editor mode — piece-lane grid view of S.drumTab.hits[].
+//
+// Activates when the user clicks the "🥁 Edit Drums" toggle button
+// (visible only when S.drumTab is non-null). The editor canvas is
+// reused: draw() forks early to _drumEditorDraw, and onMouseDown
+// forks to _drumEditorOnMouseDown. Save goes through the regular
+// _buildSaveBody which already ships drum_tab on the wire.
+//
+// Lanes are listed top→bottom in a physical-kit order (cymbals high,
+// kick low) — matches what a drummer expects when reading a sheet
+// vertically. Time runs left→right as in the rest of the editor.
+// ════════════════════════════════════════════════════════════════════
+
+// Physical-kit ordering of the drum piece-ids. Mirrors lib/drums.py's
+// PIECES dict but ordered for visual editing rather than data shape.
+const DRUM_PIECE_ORDER = [
+    'china', 'splash', 'crash_l', 'crash_r',
+    'hh_open', 'hh_closed', 'hh_pedal',
+    'ride', 'ride_bell',
+    'tom_hi', 'tom_mid', 'tom_low', 'tom_floor',
+    'snare', 'snare_xstick',
+    'kick',
+];
+
+// Display colour + shape hint per piece-id — mirrors lib/drums.py::PIECES
+// so the editor visual matches what the player highway shows.
+const DRUM_PIECE_META = {
+    kick:         { label: 'Kick',   color: '#f59e0b', cat: 'kick'   },
+    snare:        { label: 'Snare',  color: '#ef4444', cat: 'drum'   },
+    snare_xstick: { label: 'Sn(x)',  color: '#dc2626', cat: 'drum'   },
+    tom_hi:       { label: 'Tom 1',  color: '#eab308', cat: 'drum'   },
+    tom_mid:      { label: 'Tom 2',  color: '#ca8a04', cat: 'drum'   },
+    tom_low:      { label: 'Tom 3',  color: '#a16207', cat: 'drum'   },
+    tom_floor:    { label: 'Floor',  color: '#854d0e', cat: 'drum'   },
+    hh_closed:    { label: 'HH cl',  color: '#22d3ee', cat: 'cymbal' },
+    hh_open:      { label: 'HH op',  color: '#06b6d4', cat: 'cymbal' },
+    hh_pedal:     { label: 'HH pd',  color: '#0891b2', cat: 'cymbal' },
+    crash_l:      { label: 'Crash L',color: '#84cc16', cat: 'cymbal' },
+    crash_r:      { label: 'Crash R',color: '#65a30d', cat: 'cymbal' },
+    splash:       { label: 'Splash', color: '#a3e635', cat: 'cymbal' },
+    china:        { label: 'China',  color: '#4d7c0f', cat: 'cymbal' },
+    ride:         { label: 'Ride',   color: '#3b82f6', cat: 'cymbal' },
+    ride_bell:    { label: 'Bell',   color: '#1d4ed8', cat: 'cymbal' },
+};
+
+const DRUM_LANE_H = 22;
+const DRUM_HIT_RADIUS = 8;
+
+function _drumPieceCount()        { return DRUM_PIECE_ORDER.length; }
+function _drumLaneIdxToY(idx)     { return WAVEFORM_H + idx * DRUM_LANE_H; }
+function _drumYToLaneIdx(y) {
+    const idx = Math.floor((y - WAVEFORM_H) / DRUM_LANE_H);
+    if (idx < 0 || idx >= _drumPieceCount()) return -1;
+    return idx;
+}
+function _drumPieceAtY(y) {
+    const i = _drumYToLaneIdx(y);
+    return i >= 0 ? DRUM_PIECE_ORDER[i] : null;
+}
+
+// Hit lookup: which hit (if any) is under (x, y)? Returns the index into
+// S.drumTab.hits[], or -1. Tolerance is the hit's draw radius.
+function _drumHitAtPoint(x, y) {
+    if (!S.drumTab) return -1;
+    const pieceUnder = _drumPieceAtY(y);
+    if (!pieceUnder) return -1;
+    const t = xToTime(x);
+    const yLane = _drumLaneIdxToY(DRUM_PIECE_ORDER.indexOf(pieceUnder)) + DRUM_LANE_H / 2;
+    const hits = S.drumTab.hits || [];  // guard against malformed tabs with no hits[]
+    for (let i = 0; i < hits.length; i++) {
+        const h = hits[i];
+        // Hits are sorted by time; bail once we're past the click window.
+        // This check must run before the piece filter so hits on other lanes
+        // don't prevent the early break from firing.
+        if (h.t > t + 0.5) break;
+        if (h.p !== pieceUnder) continue;
+        const hx = timeToX(h.t);
+        const dx = Math.abs(hx - x);
+        const dy = Math.abs(yLane - y);
+        if (dx < DRUM_HIT_RADIUS + 2 && dy < DRUM_LANE_H / 2) return i;
+    }
+    return -1;
+}
+
+function _drumEditorDraw(w, h) {
+    const hits = S.drumTab.hits || [];
+    const visibleStart = S.scrollX - 0.5;
+    const visibleEnd = S.scrollX + (w - LABEL_W) / S.zoom + 0.5;
+
+    drawWaveform(w);
+
+    // ── Lane grid ─────────────────────────────────────────────────────
+    for (let i = 0; i < _drumPieceCount(); i++) {
+        const piece = DRUM_PIECE_ORDER[i];
+        const meta = DRUM_PIECE_META[piece];
+        const y = _drumLaneIdxToY(i);
+        ctx.fillStyle = i % 2 === 0 ? '#0c0c1c' : '#0f0f24';
+        ctx.fillRect(LABEL_W, y, w - LABEL_W, DRUM_LANE_H);
+        // Lane separator
+        ctx.strokeStyle = '#1a1a35';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(LABEL_W, y + DRUM_LANE_H);
+        ctx.lineTo(w, y + DRUM_LANE_H);
+        ctx.stroke();
+        // Lane label (left margin)
+        ctx.fillStyle = meta.color;
+        ctx.font = '10px sans-serif';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(meta.label, LABEL_W - 4, y + DRUM_LANE_H / 2);
+    }
+
+    // ── Beat grid (reuse the existing helper geometry) ────────────────
+    for (const b of (S.beats || [])) {
+        if (b.time < visibleStart || b.time > visibleEnd) continue;
+        const x = timeToX(b.time);
+        // Guard: skip lines that fall into the left label margin so beat
+        // lines from the padding region don't overdraw lane labels.
+        if (x < LABEL_W || x > w) continue;
+        ctx.strokeStyle = b.measure > 0 ? 'rgba(255,255,255,0.15)' : 'rgba(255,255,255,0.05)';
+        ctx.lineWidth = b.measure > 0 ? 1 : 0.5;
+        ctx.beginPath();
+        ctx.moveTo(x, WAVEFORM_H);
+        ctx.lineTo(x, WAVEFORM_H + _drumPieceCount() * DRUM_LANE_H);
+        ctx.stroke();
+    }
+
+    // ── Hits ──────────────────────────────────────────────────────────
+    for (let i = 0; i < hits.length; i++) {
+        const h = hits[i];
+        if (h.t < visibleStart || h.t > visibleEnd) continue;
+        const pieceIdx = DRUM_PIECE_ORDER.indexOf(h.p);
+        if (pieceIdx < 0) continue;  // unknown piece-id; renderer skip
+        const meta = DRUM_PIECE_META[h.p];
+        const cx = timeToX(h.t);
+        // Guard: skip hits that fall into the left label margin (same as
+        // drawNotes/drawGrid) so hit dots don't overdraw lane labels.
+        if (cx < LABEL_W || cx > w) continue;
+        const cy = _drumLaneIdxToY(pieceIdx) + DRUM_LANE_H / 2;
+        const sel = S.drumSel.has(i);
+        const vel = (typeof h.v === 'number') ? h.v : 100;
+        const alpha = Math.max(0.4, vel / 127);
+        const r = h.g ? DRUM_HIT_RADIUS * 0.6 : DRUM_HIT_RADIUS;
+
+        // Selection halo
+        if (sel) {
+            ctx.fillStyle = 'rgba(255,255,255,0.25)';
+            ctx.beginPath(); ctx.arc(cx, cy, r + 4, 0, Math.PI * 2); ctx.fill();
+        }
+
+        // Shape: cymbals = circle (ring if open hat), drums = rect,
+        // kick = full-lane-height vertical bar. 5 px wide is a deliberate
+        // trade-off: thin enough that double-bass at 88 ms / 120 px/s
+        // zoom (≈ 10.5 px spacing) shows two distinct bars with ~5 px
+        // gap, but fat enough to actually see at a glance. Faster than
+        // 32nd-notes at 240 BPM (≈ 3.7 px spacing) will visually merge —
+        // user zooms in for those.
+        if (meta.cat === 'kick') {
+            const bw = 5;
+            const bx = cx - bw / 2;
+            const by = cy - DRUM_LANE_H / 2 + 1;
+            const bh = DRUM_LANE_H - 2;
+            // Inner fill — velocity drives brightness.
+            ctx.fillStyle = meta.color;
+            ctx.globalAlpha = alpha;
+            ctx.fillRect(bx, by, bw, bh);
+            // Hard black outline so adjacent kicks read as distinct
+            // glyphs even when their bars touch at very narrow zoom.
+            ctx.globalAlpha = 1;
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(bx, by, bw, bh);
+            // Bright top-cap accent — adds a small "head" the eye can
+            // catch in dense passages.
+            ctx.fillStyle = '#fde68a';
+            ctx.globalAlpha = Math.min(1, alpha + 0.2);
+            ctx.fillRect(bx, by, bw, 3);
+            ctx.globalAlpha = 1;
+        } else if (h.p === 'hh_open') {
+            // Ring for open hat
+            ctx.strokeStyle = meta.color;
+            ctx.globalAlpha = alpha;
+            ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+            ctx.globalAlpha = 1;
+        } else if (meta.cat === 'cymbal') {
+            ctx.fillStyle = meta.color;
+            ctx.globalAlpha = alpha;
+            ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+            ctx.globalAlpha = 1;
+        } else {
+            // Drum (snare / tom) — rounded rectangle
+            ctx.fillStyle = meta.color;
+            ctx.globalAlpha = alpha;
+            ctx.fillRect(cx - r, cy - r * 0.6, r * 2, r * 1.2);
+            ctx.globalAlpha = 1;
+        }
+
+        // Articulation badges
+        if (h.f) {
+            // Flam — small leading dot 4px to the left
+            ctx.fillStyle = meta.color;
+            ctx.globalAlpha = 0.6;
+            ctx.beginPath(); ctx.arc(cx - 8, cy, r * 0.4, 0, Math.PI * 2); ctx.fill();
+            ctx.globalAlpha = 1;
+        }
+        if (h.k && meta && meta.cat === 'cymbal') {
+            // Choke — fade-out tail to the right. Cymbal-only: a stray `k`
+            // on a drum piece (malformed/imported data) must not render a
+            // tail, matching _drumEditorToggleArticulation's cymbal gate.
+            const tailW = Math.max(4, h.k * S.zoom);
+            const grad = ctx.createLinearGradient(cx, 0, cx + tailW, 0);
+            grad.addColorStop(0, meta.color);
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(cx, cy - 2, tailW, 4);
+        }
+        if (h.g) {
+            // Ghost — outline pip in the center
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.arc(cx, cy, 2, 0, Math.PI * 2); ctx.stroke();
+        }
+    }
+
+    // ── Cursor ────────────────────────────────────────────────────────
+    if (S.cursorTime >= visibleStart && S.cursorTime <= visibleEnd) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(timeToX(S.cursorTime), WAVEFORM_H);
+        ctx.lineTo(timeToX(S.cursorTime), WAVEFORM_H + _drumPieceCount() * DRUM_LANE_H);
+        ctx.stroke();
+    }
+
+    // ── HUD ───────────────────────────────────────────────────────────
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    const hud = `Drum editor — ${hits.length} hits, ${S.drumSel.size} selected. Click empty: add. Click hit: select. Del: remove. G/F/K: ghost/flam/choke.`;
+    ctx.fillText(hud, LABEL_W + 6, WAVEFORM_H + _drumPieceCount() * DRUM_LANE_H + 6);
+}
+
+// Add a hit at the snap-aligned time on the lane under (x, y). Returns
+// true if added (false if click was outside the lane grid).
+function _drumEditorAddHit(x, y) {
+    const piece = _drumPieceAtY(y);
+    if (!piece) return false;
+    // Reject clicks in the left label gutter — xToTime(x) there is
+    // negative and clamps to t=0, which would silently add an off-screen
+    // hit at the start of the song.
+    if (x < LABEL_W) return false;
+    const rawT = xToTime(x);
+    // Snap using snapTime() so drum hits align with the rest of the editor.
+    // Clamp after snapping: when the first beat is offset from 0, snapTime
+    // can round backward past zero and produce a negative timestamp.
+    let t = Math.max(0, snapTime(Math.max(0, rawT)));
+    if (!Array.isArray(S.drumTab.hits)) S.drumTab.hits = [];
+    S.drumTab.hits.push({ t: Math.round(t * 1000) / 1000, p: piece, v: 100 });
+    S.drumTab.hits.sort((a, b) => a.t - b.t);
+    S.drumTabDirty = true;
+    // Keep the ⟳ Drums (N) toolbar count in sync after adding a hit.
+    updateArrangementSelector();
+    return true;
+}
+
+function _drumEditorOnMouseDown(e, x, y) {
+    // Click in the waveform area above the lane grid → set cursor (no note edit).
+    if (y < WAVEFORM_H) {
+        // Waveform-area click sets the cursor like in guitar mode.
+        S.cursorTime = Math.max(0, xToTime(x));
+        if (S.playing) { stopPlayback(); startPlayback(); }
+        draw();
+        return;
+    }
+    if (y > WAVEFORM_H + _drumPieceCount() * DRUM_LANE_H) return;
+    // Clicks in the left lane-label gutter aren't on the time grid —
+    // ignore them so they neither hit-test nor add a hit.
+    if (x < LABEL_W) return;
+
+    const idx = _drumHitAtPoint(x, y);
+    if (idx >= 0) {
+        // Clicked on an existing hit. Two paths from here:
+        //   - plain click → ensure that hit is in the selection, then start
+        //     a drag that moves every selected hit together.
+        //   - Shift+click → toggle the hit in/out of the selection (no drag).
+        if (e.shiftKey) {
+            if (S.drumSel.has(idx)) S.drumSel.delete(idx);
+            else S.drumSel.add(idx);
+            draw();
+            return;
+        }
+        // If the click target isn't already selected, clear and select it
+        // so the user can grab-and-drag without a separate select click.
+        if (!S.drumSel.has(idx)) {
+            S.drumSel.clear();
+            S.drumSel.add(idx);
+        }
+        // Snapshot the selected hits so move math can compute deltas off
+        // the original times / pieces (not the live mutating values).
+        const indices = [...S.drumSel];
+        const origTimes = indices.map(i => S.drumTab.hits[i].t);
+        const origPieces = indices.map(i => S.drumTab.hits[i].p);
+        S.drag = {
+            type: 'drum-move',
+            startX: x,
+            startY: y,
+            // Anchor time for delta-snap: cursor time at drag start, used by
+            // _drumEditorOnDragMove to compute a beat-aware snapped delta via
+            // snapTime(t0 + rawDt) - snapTime(t0).
+            startTime: xToTime(x),
+            indices,
+            origTimes,
+            origPieces,
+            moved: false,
+        };
+        draw();
+        return;
+    }
+    // Clicked empty grid spot — add a hit. Shift-click in empty space
+    // doesn't extend selection (there's nothing to select).
+    if (_drumEditorAddHit(x, y)) {
+        S.drumSel.clear();
+        draw();
+    }
+}
+
+// Apply an in-progress drum-move drag — called from _onMouseMoveBody
+// when S.drag.type === 'drum-move'. Computes a single time delta from
+// the cursor drift (snapped to the editor's snap grid) and applies it
+// uniformly to every selected hit. Snapping per-hit collapses sub-grid
+// detail (e.g. 16th-note double-bass gets quantised to quarter-notes if
+// snap is set to ¼), so we snap the DELTA once and let it ride.
+function _drumEditorOnDragMove(x, y) {
+    if (!S.drag || S.drag.type !== 'drum-move' || !S.drumTab) return;
+    const dx = x - S.drag.startX;
+    const dy = y - S.drag.startY;
+    const rawDt = dx / S.zoom;
+    const dLanes = Math.round(dy / DRUM_LANE_H);
+    if (Math.abs(dx) > 2 || Math.abs(dy) > 2) S.drag.moved = true;
+    // Don't mutate hit positions for sub-2px movements: the threshold above
+    // distinguishes a click (no move) from a real drag. Applying snapped
+    // deltas before `moved` is set could snap a note across a grid boundary
+    // even though the user never intended to drag.
+    if (!S.drag.moved) return;
+    // Guard against a malformed/older drum_tab whose `hits` is missing or
+    // not an array — indexing it below would throw mid-drag. Matches the
+    // defensive `|| []` other drum-editor helpers use.
+    if (!Array.isArray(S.drumTab.hits)) return;
+    const hits = S.drumTab.hits;
+    // Snap the COMMON delta once by anchoring at the drag start time and
+    // delegating to snapTime(), which respects per-surrounding-beat
+    // intervals and handles tempo changes correctly. This preserves the
+    // relative spacing between selected hits even when the editor's snap
+    // grid is coarser than the chart's note resolution.
+    const t0 = S.drag.startTime ?? 0;
+    const rawTarget = t0 + rawDt;
+    const snappedDt = snapTime(rawTarget) - snapTime(t0);
+    for (let k = 0; k < S.drag.indices.length; k++) {
+        const idx = S.drag.indices[k];
+        const h = hits[idx];
+        if (!h) continue;
+        const newT = Math.max(0, S.drag.origTimes[k] + snappedDt);
+        h.t = Math.round(newT * 1000) / 1000;
+
+        // Lane (piece) movement — index into DRUM_PIECE_ORDER.
+        // Skip remap for unknown piece ids (indexOf returns -1) to avoid
+        // silently mapping the hit to lane 0 ("china") on the first drag.
+        const origPieceIdx = DRUM_PIECE_ORDER.indexOf(S.drag.origPieces[k]);
+        if (origPieceIdx >= 0) {
+            const newPieceIdx = Math.max(
+                0,
+                Math.min(DRUM_PIECE_ORDER.length - 1, origPieceIdx + dLanes),
+            );
+            h.p = DRUM_PIECE_ORDER[newPieceIdx];
+        }
+    }
+}
+
+// Finalise a drum-move drag — keep the hits array sorted by time so the
+// renderer's binary-search-friendly early-break stays correct, then
+// remap the selection indices through the sort. Called from onMouseUp
+// when S.drag.type === 'drum-move'.
+function _drumEditorOnDragEnd() {
+    if (!S.drag || S.drag.type !== 'drum-move' || !S.drumTab) return;
+    const moved = !!S.drag.moved;
+    if (moved) {
+        S.drumTabDirty = true;
+        const hits = S.drumTab.hits;
+        // Tag selected hits with a transient marker so we can recover their
+        // indices after the sort.
+        const sentinel = Symbol('drumSel');
+        for (const idx of S.drag.indices) {
+            if (hits[idx]) hits[idx][sentinel] = true;
+        }
+        hits.sort((a, b) => a.t - b.t);
+        S.drumSel = new Set();
+        for (let i = 0; i < hits.length; i++) {
+            if (hits[i][sentinel]) {
+                S.drumSel.add(i);
+                delete hits[i][sentinel];
+            }
+        }
+    }
+    S.drag = null;
+    draw();
+}
+
+function _drumEditorDeleteSelection() {
+    if (!S.drumTab || !S.drumSel.size) return;
+    if (!Array.isArray(S.drumTab.hits)) return;
+    const drop = S.drumSel;
+    S.drumTab.hits = S.drumTab.hits.filter((_, i) => !drop.has(i));
+    S.drumSel = new Set();
+    S.drumTabDirty = true;
+    // Keep the ⟳ Drums (N) toolbar count in sync after deleting hits.
+    updateArrangementSelector();
+}
+
+function _drumEditorToggleArticulation(kind) {
+    if (!S.drumTab) return;
+    // Guard a malformed/older drum_tab with missing/non-array `hits`.
+    if (!Array.isArray(S.drumTab.hits)) return;
+    if (S.drumSel.size) S.drumTabDirty = true;
+    const field = kind === 'g' ? 'g' : kind === 'f' ? 'f' : 'k';
+    for (const idx of S.drumSel) {
+        const h = S.drumTab.hits[idx];
+        if (!h) continue;
+        if (field === 'k') {
+            // Choke is only meaningful on cymbal pieces; ignored on drums.
+            const meta = DRUM_PIECE_META[h.p];
+            if (!meta || meta.cat !== 'cymbal') continue;
+            if (h.k) delete h.k; else h.k = 0.08;
+        } else {
+            if (h[field]) delete h[field]; else h[field] = true;
+        }
+    }
+}
+
+// ── Drum-edit toggle button (injected next to the +Drums button) ─────
+
+function _ensureDrumEditButton() {
+    let btn = document.getElementById('editor-drum-edit-btn');
+    if (!btn) {
+        const drumsBtn = document.getElementById('editor-add-drums-btn');
+        if (!drumsBtn) return null;
+        btn = document.createElement('button');
+        btn.id = 'editor-drum-edit-btn';
+        btn.type = 'button';
+        btn.textContent = '🥁 Edit Drums';
+        btn.className = 'px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs font-medium hidden';
+        btn.title = 'Open the piece-lane drum editor';
+        btn.onclick = () => {
+            S.drumEditMode = !S.drumEditMode;
+            S.drumSel = new Set();
+            // Close any open guitar/keys note UI and drop the stale
+            // arrangement selection — while the drum grid is showing, the
+            // note context menu / add-note popover would otherwise stay
+            // interactive and could mutate the hidden arrangement.
+            hideContextMenu();
+            hideAddNote();
+            S.sel.clear();
+            _refreshDrumEditButton();
+            draw();
+        };
+        drumsBtn.parentNode.insertBefore(btn, drumsBtn.nextSibling);
+    }
+    return btn;
+}
+
+let _drumEditBtnState = '';  // cached signature; button only updates when state changes
+
+function _refreshDrumEditButton() {
+    const btn = _ensureDrumEditButton();
+    if (!btn) return;
+    // Memoize on the fields that actually affect the button so it
+    // does not cause layout/paint work on every requestAnimationFrame.
+    // Include format: drum editing can only be persisted in sloppak sessions.
+    const sig = `${!!S.drumTab}|${!!S.sessionId}|${!!S.drumEditMode}|${S.format}`;
+    if (sig === _drumEditBtnState) return;
+    _drumEditBtnState = sig;
+    btn.classList.toggle('hidden', !S.drumTab || !S.sessionId || S.format !== 'sloppak');
+    if (S.drumEditMode) {
+        btn.textContent = '🎸 Back to Notes';
+        btn.classList.add('bg-amber-600', 'hover:bg-amber-500');
+        btn.classList.remove('bg-dark-600', 'hover:bg-dark-500');
+    } else {
+        btn.textContent = '🥁 Edit Drums';
+        btn.classList.remove('bg-amber-600', 'hover:bg-amber-500');
+        btn.classList.add('bg-dark-600', 'hover:bg-dark-500');
+    }
+}
+
+// Hook into the existing updateArrangementSelector toolbar pass so the
+// button shows/hides alongside +Drums whenever the editor re-renders
+// its controls.
+const _checkBtnInterval = setInterval(() => {
+    if (document.getElementById('editor-add-drums-btn')) {
+        _refreshDrumEditButton();
+        clearInterval(_checkBtnInterval);
+    }
+}, 200);
+// Run on every draw via a lightweight side-channel — draw is called on
+// every state change. Memoization in _refreshDrumEditButton prevents
+// DOM mutations on every requestAnimationFrame tick.
+const _origDraw = draw;
+draw = function () {
+    _refreshDrumEditButton();
+    return _origDraw.apply(this, arguments);
+};
 
 // Run init after DOM is ready
 if (document.getElementById('editor-canvas')) {

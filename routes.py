@@ -26,6 +26,11 @@ import yaml
 # GP imports (RsCli parses albumYear as Int32 and rejects anything else).
 _YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
 
+# Sentinel object used to distinguish "drum_tab key absent from JSON body"
+# from an explicit None (removal) or a dict (new payload).  Using an object
+# rather than a string avoids a spoofing vector where a client sends the
+# sentinel string value and accidentally (or maliciously) trips the no-op path.
+_DRUM_TAB_ABSENT = object()
 
 _sessions = None
 
@@ -453,6 +458,15 @@ def setup(app, context):
                 manifest_offset = 0.0
             if manifest_offset:
                 result["offset"] = manifest_offset
+            # Surface the parsed drum_tab (if any) so the editor frontend can
+            # show a "drums present" indicator and the +Drums modal can offer
+            # Replace vs Cancel rather than silently overwriting. getattr
+            # guard: an older Slopsmith core whose LoadedSloppak predates
+            # the drum_tab field would otherwise raise AttributeError and
+            # 500 the whole load.
+            _loaded_drum_tab = getattr(loaded, "drum_tab", None)
+            if _loaded_drum_tab is not None:
+                result["drum_tab"] = _loaded_drum_tab
             # Carry the manifest-derived arrangement id list onto each
             # arrangement so the frontend can round-trip it back to us.
             # Use a single `used_ids` set when generating fallback ids so two
@@ -582,6 +596,54 @@ def setup(app, context):
         # arrangements were added). If arrangements isn't provided, save_cdlc
         # only updates the single arrangement at arrangement_index.
         all_arrangements = data.get("arrangements")
+
+        # Drum-tab payload: when the +Drums modal added a drum_tab.json on top
+        # of the song, the frontend ships the dict here. The three values
+        # have distinct meanings:
+        #   - dict  → persist alongside the manifest under `drum_tab.json`
+        #             and set `manifest['drum_tab'] = 'drum_tab.json'`.
+        #   - key absent → _DRUM_TAB_ABSENT sentinel → no change;
+        #             existing drum_tab passes through via the manifest,
+        #             untouched. This is what the editor frontend sends
+        #             unless the user imported/edited a drum tab this session.
+        #   - None  → explicit removal — unlinks drum_tab.json and clears the
+        #             manifest key. Supported by the API for completeness;
+        #             the current editor UI has no remove-drums control.
+        drum_tab_payload = data.get("drum_tab", _DRUM_TAB_ABSENT)
+        if drum_tab_payload is not _DRUM_TAB_ABSENT and not isinstance(
+            drum_tab_payload, (dict, type(None))
+        ):
+            return JSONResponse(
+                {"error": "drum_tab must be a JSON object or null"},
+                status_code=400,
+            )
+        # drum_tab.json is a sloppak-format artifact — _save_psarc() can't
+        # carry it. Reject a drum_tab on a non-sloppak session rather than
+        # silently dropping it, so the client doesn't get a 200 and assume
+        # the drum tab persisted.
+        if (
+            drum_tab_payload is not _DRUM_TAB_ABSENT
+            and session.get("format") != "sloppak"
+        ):
+            return JSONResponse(
+                {"error": "drum_tab can only be saved to sloppak-format songs"},
+                status_code=400,
+            )
+        # Schema-validate a dict payload at the request boundary, using the
+        # SAME validator the sloppak loader applies on the next song load.
+        # Without this a structurally-invalid drum_tab (bad version type,
+        # non-list hits, etc.) could be written to disk and silently dropped
+        # by the loader, leaving a manifest `drum_tab:` key pointing at an
+        # unloadable file. Per-hit junk is still cleaned by the dedup pass in
+        # _save_sloppak; this catches the top-level schema.
+        if isinstance(drum_tab_payload, dict):
+            from lib.drums import validate_drum_tab as _validate_drum_tab
+            _dt_ok, _dt_reason = _validate_drum_tab(drum_tab_payload)
+            if not _dt_ok:
+                return JSONResponse(
+                    {"error": f"invalid drum_tab: {_dt_reason}"},
+                    status_code=400,
+                )
 
         # Explicit opt-in to lose extended-range data on a PSARC save.
         # Set by the frontend when the user picked "Save as PSARC (lose
@@ -902,6 +964,106 @@ def setup(app, context):
                     except OSError:
                         pass
 
+            # Drum-tab persist: write/update/remove drum_tab.json alongside the
+            # manifest per sloppak-spec §5.3.
+            #   missing key  → _DRUM_TAB_ABSENT sentinel → no-op (leave as-is)
+            #   explicit null → None               → remove drum_tab.json
+            #   dict          →                    → write/replace the file
+            # Non-dict/non-null payloads are rejected with a 400 early in
+            # save_cdlc before this closure is reached.
+            if drum_tab_payload is not _DRUM_TAB_ABSENT:
+                drum_tab_path = (source_dir / "drum_tab.json").resolve()
+                # Constrain writes to source_dir — defends against a malformed
+                # session that escaped its sandbox.
+                try:
+                    drum_tab_path.relative_to(source_dir)
+                except ValueError:
+                    raise RuntimeError("drum_tab path escapes sandbox")
+                if isinstance(drum_tab_payload, dict):
+                    # Defensive dedup: drop near-equal (t, p) duplicates before
+                    # writing. Local testing showed earlier corruption could
+                    # quietly survive load→edit→save round-trips, with each
+                    # save persisting the same junk forever. Server-side
+                    # dedup breaks that cycle so the next save heals the
+                    # file even if the client somehow held duplicates.
+                    _hits_raw = drum_tab_payload.get("hits", [])
+                    if not isinstance(_hits_raw, list):
+                        import logging as _log_hits
+                        _log_hits.getLogger("slopsmith.plugin.editor").warning(
+                            "drum_tab.hits is not a list (got %s) — treating as empty",
+                            type(_hits_raw).__name__,
+                        )
+                        _hits_raw = []
+                    import math as _math
+                    _hits_in: list = _hits_raw or []
+                    _seen: set = set()
+                    _deduped: list[dict] = []
+                    _malformed_count: int = 0
+                    _dup_count: int = 0
+                    for _h in _hits_in:
+                        if not isinstance(_h, dict):
+                            _malformed_count += 1
+                            continue
+                        # Require a valid non-negative finite numeric t and a
+                        # non-empty piece id — hits missing either field are
+                        # malformed and would fail schema validation on next load.
+                        try:
+                            _t = float(_h.get("t"))  # type: ignore[arg-type]
+                            _p = str(_h.get("p") or "")
+                        except (TypeError, ValueError):
+                            _malformed_count += 1
+                            continue
+                        if not _math.isfinite(_t) or _t < 0:
+                            _malformed_count += 1
+                            continue
+                        if not _p:
+                            _malformed_count += 1
+                            continue
+                        _t_rounded = round(_t, 3)
+                        _key = (_t_rounded, _p)
+                        if _key in _seen:
+                            _dup_count += 1
+                            continue
+                        _seen.add(_key)
+                        # Build a sanitized hit: coerce both t and p so
+                        # drum_tab.json always stores a numeric timestamp and a
+                        # string piece-id regardless of what the client sent.
+                        _clean_h = dict(_h)
+                        _clean_h["t"] = _t_rounded
+                        _clean_h["p"] = _p
+                        _deduped.append(_clean_h)
+                    import logging as _logging
+                    _dtlog = _logging.getLogger("slopsmith.plugin.editor")
+                    if _malformed_count:
+                        _dtlog.warning(
+                            "drum_tab: dropped %d malformed hits during save",
+                            _malformed_count,
+                        )
+                    if _dup_count:
+                        _dtlog.warning(
+                            "drum_tab: dropped %d duplicate (t, piece) hits during save",
+                            _dup_count,
+                        )
+                    # Sort by t so drum_tab.json is always time-ordered;
+                    # the frontend binary-search and drag-snap code depends
+                    # on this invariant.
+                    _deduped.sort(key=lambda _h2: _h2["t"])
+                    # Write a shallow copy so we don't mutate the body dict
+                    # parsed by FastAPI. Reassigning `drum_tab_payload` would
+                    # make the whole closure treat the name as local and
+                    # break the earlier `drum_tab_payload is not _DRUM_TAB_ABSENT`
+                    # read (UnboundLocalError).
+                    _persisted = dict(drum_tab_payload)
+                    _persisted["hits"] = _deduped
+                    drum_tab_path.write_text(
+                        json.dumps(_persisted, separators=(",", ":")),
+                        encoding="utf-8",
+                    )
+                    manifest["drum_tab"] = "drum_tab.json"
+                else:
+                    drum_tab_path.unlink(missing_ok=True)
+                    manifest.pop("drum_tab", None)
+
             # Apply edited top-level metadata (title/artist/album/year only —
             # don't let the editor overwrite stems/lyrics/cover paths).
             if metadata:
@@ -919,6 +1081,15 @@ def setup(app, context):
                 yaml.safe_dump(manifest, sort_keys=False, allow_unicode=True),
                 encoding="utf-8",
             )
+
+            # Propagate the freshly-written manifest back into the in-memory
+            # session. Without this, a later save in the same session that
+            # omits `drum_tab` (the no-op path) would re-serialise the STALE
+            # cached manifest — silently dropping the `drum_tab:` key and
+            # un-linking drum_tab.json. Keeping the session manifest in sync
+            # with disk makes every subsequent save start from current state.
+            if isinstance(session.get("sloppak_state"), dict):
+                session["sloppak_state"]["manifest"] = manifest
 
             # Directory-form sloppak: source_dir IS the sloppak — we've already
             # rewritten everything in place. Don't try to zip on top of it.
@@ -1803,6 +1974,187 @@ def setup(app, context):
             return JSONResponse({"error": str(e)}, 500)
 
         return {"arrangement": arr_data, "tmp_dir": tmp_dir, "xml_path": xml_path}
+
+    # ── Import drum track → drum_tab.json (GP file) ──────────────────
+    #
+    # Sibling to `import-drums` above. That endpoint returns a guitar-style
+    # arrangement dict (drums MIDI-encoded via string*24+fret) for the legacy
+    # drums plugin path. The new endpoint returns the canonical
+    # `drum_tab.json` shape documented in `docs/sloppak-spec.md` §5.3, ready
+    # to be persisted via /save_cdlc's new `drum_tab:` body field.
+
+    @app.post("/api/plugins/editor/import-drums-tab")
+    async def import_drums_tab(data: dict):
+        """Import a GP drum track and return it as a drum_tab.json dict."""
+        from lib.gp2rs import convert_drum_track_to_drumtab
+        import guitarpro
+
+        gp_path_raw = data.get("gp_path", "")
+        track_index = data.get("track_index")
+        try:
+            audio_offset = float(data.get("audio_offset", 0.0))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "audio_offset must be a number"}, 400)
+
+        validated = _validate_editor_upload_path(gp_path_raw, "slopsmith_gp_")
+        if not validated:
+            return JSONResponse({"error": "GP file not found"}, 400)
+        gp_path = str(validated)
+        if track_index is None:
+            return JSONResponse({"error": "track_index required"}, 400)
+        try:
+            track_index = int(track_index)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "track_index must be an integer"}, 400)
+
+        arr_name = str(data.get("arrangement_name") or "Drums") or "Drums"
+
+        def _convert():
+            song = guitarpro.parse(gp_path)
+            return convert_drum_track_to_drumtab(
+                song, track_index, audio_offset, arr_name,
+            )
+
+        try:
+            drum_tab = await asyncio.get_event_loop().run_in_executor(None, _convert)
+        except IndexError:
+            # song.tracks[track_index] out of range — a client input error,
+            # not a server fault. Leave the upload dir for a retry.
+            return JSONResponse(
+                {"error": f"track_index {track_index} out of range"}, 400
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            # Leave the upload temp dir on failure so the user can retry.
+            return JSONResponse({"error": str(e)}, 500)
+
+        # Clean up the GP upload temp dir now that conversion succeeded —
+        # mirrors import_keys_midi. Without this, slopsmith_gp_* dirs would
+        # accumulate in the system temp dir indefinitely.
+        try:
+            shutil.rmtree(Path(gp_path).parent)
+        except OSError as _cleanup_err:
+            import warnings
+            warnings.warn(f"Could not clean up GP temp dir: {_cleanup_err}")
+
+        return {"drum_tab": drum_tab}
+
+    # ── MIDI drum import: list channel 10 (index 9) tracks ──────────
+
+    @app.post("/api/plugins/editor/import-drums-midi-list")
+    async def import_drums_midi_list(file: UploadFile = File(...)):
+        """Upload a MIDI file and list channel 10 (drum) tracks for the picker.
+
+        MIDI channel 10 is the General MIDI percussion channel; in 0-based
+        wire encoding this is channel index 9 — `list_drum_tracks` filters
+        on `channel == 9`. Returns `{midi_path, tracks: [...]}` so the
+        frontend can show a track-picker modal identical to the keys flow.
+        """
+        from lib.midi_import import list_drum_tracks
+
+        orig_suffix = Path(file.filename or "").suffix.lower()
+        if orig_suffix not in (".mid", ".midi"):
+            return JSONResponse(
+                {"error": "Only .mid/.midi files are accepted"}, 400
+            )
+
+        # Opportunistic TTL cleanup of stale upload sandboxes (30 min).
+        # Matches the keys-midi path so unclaimed uploads don't accumulate.
+        _ttl_secs = 30 * 60
+        tmp_root = Path(tempfile.gettempdir())
+        for _stale in tmp_root.glob("slopsmith_drums_midi_*"):
+            try:
+                if _stale.is_dir():
+                    age = time.time() - _stale.stat().st_mtime
+                    if age > _ttl_secs:
+                        shutil.rmtree(_stale, ignore_errors=True)
+            except OSError:
+                pass
+
+        suffix = orig_suffix or ".mid"
+        tmp = tempfile.mkdtemp(prefix="slopsmith_drums_midi_")
+        midi_path = os.path.join(tmp, "upload" + suffix)
+        content = await file.read()
+        Path(midi_path).write_bytes(content)
+
+        def _list():
+            return list_drum_tracks(midi_path)
+
+        try:
+            tracks = await asyncio.get_event_loop().run_in_executor(None, _list)
+        except Exception as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return JSONResponse({"error": f"Failed to parse MIDI file: {e}"}, 500)
+
+        if not tracks:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return JSONResponse(
+                {"error": "No drum (channel-10) tracks found in MIDI file"}, 400
+            )
+
+        return {"midi_path": midi_path, "tracks": tracks}
+
+    # ── MIDI drum import: convert a track → drum_tab.json ──────────
+
+    @app.post("/api/plugins/editor/import-drums-midi")
+    async def import_drums_midi(data: dict):
+        """Convert a MIDI drum track to a drum_tab.json dict."""
+        from lib.midi_import import convert_drum_track_from_midi
+
+        midi_path_raw = data.get("midi_path", "")
+        track_index = data.get("track_index")
+        try:
+            audio_offset = float(data.get("audio_offset", 0.0))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "audio_offset must be a number"}, 400)
+
+        validated = _validate_editor_upload_path(midi_path_raw, "slopsmith_drums_midi_")
+        if not validated:
+            return JSONResponse({"error": "MIDI file not found"}, 400)
+        midi_path = str(validated)
+        if track_index is None:
+            return JSONResponse({"error": "track_index required"}, 400)
+        try:
+            track_index = int(track_index)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "track_index must be an integer"}, 400)
+
+        arr_name = str(data.get("arrangement_name") or "Drums") or "Drums"
+
+        def _convert():
+            return convert_drum_track_from_midi(
+                midi_path, track_index, audio_offset, arr_name,
+            )
+
+        _midi_tmp_dir = Path(midi_path).parent
+        try:
+            drum_tab = await asyncio.get_event_loop().run_in_executor(None, _convert)
+        except ValueError as e:
+            # convert_drum_track_from_midi raises ValueError for client input
+            # errors (track_index out of range, non-finite audio_offset) —
+            # surface those as 400, not a 500. Upload dir left for a retry.
+            return JSONResponse({"error": str(e)}, 400)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            # Leave the upload temp dir in place on failure — the frontend
+            # keeps `_addDrumsFile` and re-enables the Import button, so the
+            # user can retry the same upload. Deleting the dir here would
+            # make that retry 404 with "MIDI file not found". Stale dirs are
+            # swept by the opportunistic TTL cleanup, same as import_keys_midi.
+            return JSONResponse({"error": str(e)}, 500)
+
+        # Clean up the MIDI temp dir now that conversion is complete — mirrors
+        # import_keys_midi which also rmtrees after a successful conversion so
+        # temp dirs don't accumulate between TTL cleanup runs.
+        try:
+            shutil.rmtree(_midi_tmp_dir)
+        except OSError as _cleanup_err:
+            import warnings
+            warnings.warn(f"Could not clean up drums MIDI temp dir: {_cleanup_err}")
+
+        return {"drum_tab": drum_tab}
 
     # ── Remove arrangement from session ────────────────────────────
 

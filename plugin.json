@@ -1,7 +1,7 @@
 {
     "id": "editor",
     "name": "Arrangement Editor",
-    "version": "1.0.2",
+    "version": "1.1.0",
     "nav": {
         "label": "Editor",
         "screen": "editor"
