@@ -33,6 +33,7 @@ _sessions = None
 def setup(app, context):
     config_dir = context["config_dir"]
     get_dlc_dir = context["get_dlc_dir"]
+    log = context["log"]
 
     from lib.song import load_song, phrase_to_wire
     from lib.psarc import unpack_psarc
@@ -1128,6 +1129,7 @@ def setup(app, context):
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     title = info.get("title", "audio")
+                    thumbnail_url = info.get("thumbnail")
 
                 # Find the output file
                 for f in Path(tmp).iterdir():
@@ -1136,11 +1138,24 @@ def setup(app, context):
                         ext = f.suffix
                         dest = STORAGE_DIR / f"editor_audio_{audio_id}{ext}"
                         shutil.copy2(f, dest)
-                        shutil.rmtree(tmp, ignore_errors=True)
-                        return {
+
+                        result = {
                             "audio_url": f"{STORAGE_URL}/editor_audio_{audio_id}{ext}",
                             "title": title,
                         }
+
+                        # Download thumbnail if available
+                        if thumbnail_url:
+                            try:
+                                import urllib.request
+                                thumb_dest = STORAGE_DIR / f"editor_thumb_{audio_id}.jpg"
+                                urllib.request.urlretrieve(thumbnail_url, thumb_dest)
+                                result["thumbnail_url"] = f"{STORAGE_URL}/editor_thumb_{audio_id}.jpg"
+                            except Exception as e:
+                                print(f"[Editor] Failed to download thumbnail: {e}")
+
+                        shutil.rmtree(tmp, ignore_errors=True)
+                        return result
 
                 shutil.rmtree(tmp, ignore_errors=True)
                 raise RuntimeError("No audio file produced")
@@ -1918,12 +1933,17 @@ def setup(app, context):
         meta.update(data.get("metadata") or {})
         audio_url = data.get("audio_url", "")
         art_path = data.get("art_path", "")
+        thumbnail_url = data.get("thumbnail_url", "")
 
         needs_sloppak = any(_is_extended_range(a) for a in arrangements_data)
 
         def _build():
             # Write each arrangement's data to its corresponding XML
             xml_files = session["xml_files"]
+            log.info(f"[Build] Session has {len(xml_files)} XML files")
+            log.info(f"[Build] Received {len(arrangements_data)} arrangements from frontend")
+            log.info(f"[Build] Beats: {len(beats)}, Sections: {len(sections)}")
+
             for i, xml_path in enumerate(xml_files):
                 tree = ET.parse(xml_path)
                 old_root = tree.getroot()
@@ -1933,23 +1953,28 @@ def setup(app, context):
                     arr_notes = arr.get("notes", [])
                     arr_chords = arr.get("chords", [])
                     arr_templates = arr.get("chord_templates", [])
+                    log.info(f"[Build] Arr {i}: {arr_notes.__len__()} notes, {arr_chords.__len__()} chords")
                 else:
                     arr_notes, arr_chords, arr_templates = [], [], []
+                    log.warning(f"[Build] Arr {i}: No data received from frontend")
 
                 xml_str = _build_arrangement_xml(
                     old_root, arr_notes, arr_chords, arr_templates,
                     beats, sections, meta,
                 )
                 Path(xml_path).write_text(xml_str, encoding="utf-8")
+                log.info(f"[Build] Wrote XML to {xml_path}")
 
             # Resolve audio file path from URL. Handles both the legacy
             # /static/* form (web Docker) and the cache /api/plugins/editor/cache/*
             # form (desktop bundles) — see _resolve_storage_url().
+            log.info(f"[Build] Resolving audio_url: {audio_url}")
             resolved = _resolve_storage_url(audio_url) if audio_url else None
             audio_file = str(resolved) if resolved else ""
+            log.info(f"[Build] Resolved to: {audio_file}, exists: {Path(audio_file).exists() if audio_file else False}")
 
             if not audio_file or not Path(audio_file).exists():
-                raise RuntimeError("No audio file available for build")
+                raise RuntimeError(f"No audio file available for build (url={audio_url}, resolved={audio_file})")
 
             # Get arrangement names from XMLs, deduplicate
             arr_names = []
@@ -1962,6 +1987,7 @@ def setup(app, context):
                 if name_counts[name] > 1:
                     name = f"{name}{name_counts[name]}"
                 arr_names.append(name)
+            log.info(f"[Build] Arrangement names: {arr_names}")
             # Also rename in the XMLs so manifests match
             for xp, name in zip(xml_files, arr_names):
                 tree = ET.parse(xp)
@@ -1976,8 +2002,27 @@ def setup(app, context):
             safe_t = re.sub(r'[<>:"/\\|?*]', '_', title)
             safe_a = re.sub(r'[<>:"/\\|?*]', '_', artist)
             output = str(dlc_dir / f"{safe_t}_{safe_a}_p.psarc")
+            log.info(f"[Build] Output path: {output}")
+            log.info(f"[Build] Title: {title}, Artist: {artist}")
 
-            return build_cdlc(
+            # Resolve album art: use uploaded art first, then thumbnail URL as fallback
+            final_art_path = ""
+            if art_path and Path(art_path).exists():
+                final_art_path = art_path
+                log.info(f"[Build] Using uploaded album art: {final_art_path}")
+            elif thumbnail_url:
+                # Download thumbnail to temp file
+                resolved_thumb = _resolve_storage_url(thumbnail_url) if thumbnail_url else None
+                if resolved_thumb and resolved_thumb.exists():
+                    final_art_path = str(resolved_thumb)
+                    log.info(f"[Build] Using YouTube thumbnail: {final_art_path}")
+                else:
+                    log.warning(f"[Build] Thumbnail URL provided but could not resolve: {thumbnail_url}")
+            else:
+                log.info(f"[Build] No album art provided")
+
+            log.info(f"[Build] Calling build_cdlc with {len(xml_files)} XMLs")
+            result = build_cdlc(
                 xml_paths=xml_files,
                 arrangement_names=arr_names,
                 audio_path=audio_file,
@@ -1986,8 +2031,10 @@ def setup(app, context):
                 album=meta.get("albumName") or meta.get("album", ""),
                 year=str(meta.get("albumYear") or meta.get("year", "")),
                 output_path=output,
-                album_art_path=art_path if art_path and Path(art_path).exists() else "",
+                album_art_path=final_art_path,
             )
+            log.info(f"[Build] build_cdlc returned: {result}")
+            return result
 
         def _build_sloppak_extended():
             """Build a .sloppak for extended-range charts (>6 guitar / >4 bass).
@@ -2637,3 +2684,404 @@ def setup(app, context):
                 print(f"[Editor] xml2sng failed: {result.stderr}")
         except Exception as e:
             print(f"[Editor] xml2sng error: {e}")
+
+    # ── Transcribe audio: stem separation + note detection ───────────
+    @app.post("/api/plugins/editor/transcribe-audio")
+    async def transcribe_audio(data: dict):
+        """Transcribe audio into arrangements using stem separation and basic-pitch."""
+        from lib.song import Song, Beat, Section, Arrangement, Note
+        from lib.sloppak_convert import split_sloppak_stems, demucs_available
+
+        def _transcribe_with_basic_pitch(stem_path: str) -> list:
+            """Transcribe a single audio file with basic-pitch, return note events."""
+            from basic_pitch.inference import predict, ICASSP_2022_MODEL_PATH
+            model_output, midi_data, note_events = predict(
+                str(stem_path),
+                ICASSP_2022_MODEL_PATH
+            )
+            return note_events
+
+        def _midi_events_to_notes(note_events: list, string_count: int) -> list:
+            """Convert MIDI note events to Rocksmith Note objects."""
+            # Standard tunings (MIDI note numbers)
+            if string_count == 4:
+                open_strings = [28, 33, 38, 43]  # E1, A1, D2, G2 (bass)
+            else:
+                open_strings = [40, 45, 50, 55, 59, 64]  # E2, A2, D3, G3, B3, E4 (guitar)
+
+            notes = []
+
+            for start_time, end_time, pitch, velocity, pitch_bend in note_events:
+                # Find best string and fret
+                best_string = 0
+                best_fret = 0
+                min_distance = float('inf')
+
+                for s, open_pitch in enumerate(open_strings):
+                    fret = pitch - open_pitch
+                    if 0 <= fret <= 24:
+                        # Prefer lower frets on higher strings
+                        distance = abs(fret - 5) + s * 0.5
+                        if distance < min_distance:
+                            min_distance = distance
+                            best_string = s
+                            best_fret = fret
+
+                if min_distance == float('inf'):
+                    continue
+
+                duration = end_time - start_time
+                sustain = float(duration) if duration > 0.1 else 0.0
+
+                note = Note(
+                    time=float(start_time),
+                    string=best_string,
+                    fret=int(best_fret),
+                    sustain=sustain
+                )
+
+                notes.append(note)
+
+            notes.sort(key=lambda n: n.time)
+            return notes
+
+        def _transcribe_stems_to_arrangements(stem_files: list) -> list:
+            """Transcribe audio stems to arrangements using basic-pitch."""
+            try:
+                from basic_pitch.inference import predict
+                from basic_pitch import ICASSP_2022_MODEL_PATH
+            except ImportError:
+                print("[Editor] basic-pitch not installed, creating empty arrangements")
+                arrangements = []
+                for stem_path, stem_name in stem_files:
+                    arr_name = stem_name.replace(".ogg", "")
+                    string_count = 4 if arr_name == "bass" else 6
+                    tuning = [-4, -9, -14, -19] if string_count == 4 else [0, 0, 0, 0, 0, 0]
+                    arr = Arrangement(
+                        name=arr_name.capitalize(),
+                        tuning=tuning,
+                        capo=0
+                    )
+                    arrangements.append(arr)
+                return arrangements
+
+            arrangements = []
+
+            for stem_path, stem_name in stem_files:
+                arr_name = stem_name.replace(".ogg", "")
+                if arr_name not in ["guitar", "bass", "full"]:
+                    continue
+
+                string_count = 4 if arr_name == "bass" else 6
+
+                try:
+                    print(f"Predicting MIDI for {stem_path}...")
+                    # Verify file exists before basic-pitch
+                    if not Path(stem_path).exists():
+                        raise FileNotFoundError(f"Stem file does not exist: {stem_path}")
+                    print(f"[Editor] File verified, size: {Path(stem_path).stat().st_size} bytes")
+                    # Run basic-pitch
+                    model_output, midi_data, note_events = predict(
+                        str(stem_path),
+                        ICASSP_2022_MODEL_PATH
+                    )
+
+                    # Convert to notes
+                    notes = _midi_events_to_notes(note_events, string_count)
+
+                    name = arr_name.capitalize() if arr_name != "full" else "Lead"
+                    tuning = [-4, -9, -14, -19] if string_count == 4 else [0, 0, 0, 0, 0, 0]
+                    arr = Arrangement(
+                        name=name,
+                        tuning=tuning,
+                        capo=0,
+                        notes=notes
+                    )
+                    arrangements.append(arr)
+
+                    print(f"[Editor] Transcribed {len(notes)} notes from {stem_name}")
+                except Exception as e:
+                    print(f"[Editor] Failed to transcribe {stem_name}: {e}")
+
+            return arrangements
+
+        audio_url = data.get("audio_url", "")
+        split_stems = data.get("split_stems", True)
+        transcribe_notes = data.get("transcribe_notes", True)
+        title = data.get("title", "Untitled")
+        artist = data.get("artist", "Unknown")
+        album = data.get("album", "")
+        year_str = data.get("year", "")
+
+        if not audio_url:
+            return JSONResponse({"error": "Audio URL required"}, 400)
+
+        # Resolve audio URL to local path
+        audio_path = _resolve_storage_url(audio_url)
+        if not audio_path or not audio_path.exists():
+            return JSONResponse({"error": "Audio file not found"}, 400)
+
+        def _transcribe():
+            import subprocess  # Import at function start to avoid UnboundLocalError
+
+            tmp = tempfile.mkdtemp(prefix="slopsmith_editor_transcribe_")
+
+            # Create a temporary sloppak structure for stem splitting
+            stems_dir = Path(tmp) / "stems"
+            stems_dir.mkdir()
+
+            # Copy audio to stems/full.ogg
+            full_audio = stems_dir / "full.ogg"
+
+            # Convert to OGG if needed
+            try:
+                if audio_path.suffix.lower() != ".ogg":
+                    print(f"[Editor] Converting {audio_path} to OGG...")
+                    # Convert using ffmpeg
+                    result = subprocess.run([
+                        'ffmpeg', '-i', str(audio_path),
+                        '-c:a', 'libvorbis', '-q:a', '5',
+                        '-y', str(full_audio)
+                    ], check=True, capture_output=True, text=True)
+                    print(f"[Editor] Conversion complete")
+                else:
+                    print(f"[Editor] Copying OGG file {audio_path}...")
+                    # Already OGG, just copy
+                    shutil.copy2(audio_path, full_audio)
+                    print(f"[Editor] Copy complete")
+
+                if not full_audio.exists():
+                    raise FileNotFoundError(f"Audio file was not created at {full_audio}")
+
+                print(f"[Editor] Audio file ready at {full_audio} ({full_audio.stat().st_size} bytes)")
+            except subprocess.CalledProcessError as e:
+                print(f"[Editor] FFmpeg failed: {e.stderr}")
+                raise
+            except Exception as e:
+                print(f"[Editor] Audio preparation failed: {e}")
+                raise
+
+            # Split stems if requested
+            stem_files = []
+            if split_stems and demucs_available():
+                try:
+                    # Create minimal manifest.yaml for stem splitting
+                    import yaml
+                    manifest = {
+                        "title": title,
+                        "artist": artist,
+                        "stems": [{"id": "full", "file": "stems/full.ogg"}]
+                    }
+                    manifest_path = Path(tmp) / "manifest.yaml"
+                    manifest_path.write_text(
+                        yaml.safe_dump(manifest, sort_keys=False, allow_unicode=True),
+                        encoding="utf-8"
+                    )
+                    print(f"[Editor] Created manifest.yaml for stem splitting")
+
+                    # Split stems using Demucs (no progress callback needed)
+                    split_sloppak_stems(Path(tmp))
+                    # Collect all stem files that Demucs produced
+                    # htdemucs_6s can produce: guitar, bass, drums, vocals, piano, other
+                    for stem_name in ["guitar.ogg", "bass.ogg", "piano.ogg", "drums.ogg", "vocals.ogg", "other.ogg"]:
+                        stem_path = stems_dir / stem_name
+                        if stem_path.exists():
+                            stem_files.append((stem_path, stem_name))
+                except Exception as e:
+                    print(f"[Editor] Stem splitting failed: {e}")
+                    # Fall back to full audio only
+                    stem_files = [(full_audio, "full.ogg")]
+            else:
+                stem_files = [(full_audio, "full.ogg")]
+
+            # Verify stem files exist after collection
+            print(f"[Editor] Stem files collected: {len(stem_files)} files")
+            for stem_path, stem_name in stem_files:
+                exists = Path(stem_path).exists()
+                print(f"[Editor] - {stem_name}: {'EXISTS' if exists else 'MISSING'} at {stem_path}")
+
+            # Get audio duration
+            try:
+                result = subprocess.run([
+                    'ffprobe', '-v', 'error',
+                    '-show_entries', 'format=duration',
+                    '-of', 'default=noprint_wrappers=1:nokey=1',
+                    str(full_audio)
+                ], capture_output=True, text=True, check=True)
+                duration = float(result.stdout.strip())
+            except Exception:
+                duration = 180.0  # Fallback
+
+            # Generate Rocksmith XML files directly from transcribed notes
+            from lib.gp2rs import convert_file
+            import xml.etree.ElementTree as XET
+
+            # Default BPM for beat generation
+            bpm = 120
+            beat_duration = 60.0 / bpm
+
+            xml_paths = []
+
+            # Create one XML file per stem
+            for stem_idx, (stem_path, stem_name) in enumerate(stem_files):
+                arr_name = stem_name.replace(".ogg", "")
+                arr_lower = arr_name.lower()
+
+                # Determine instrument type and string count
+                if arr_lower == "bass":
+                    string_count = 4
+                    tuning = [-4, -9, -14, -19]  # 4-string bass E standard
+                elif arr_lower in ["piano", "vocals", "other"]:
+                    string_count = 6  # Map to 6-string for wider range
+                    tuning = [0, 0, 0, 0, 0, 0]  # Standard tuning
+                elif arr_lower == "drums":
+                    # Skip drums - percussive transcription needs different approach
+                    print(f"[Editor] Skipping drums stem (not yet supported for transcription)")
+                    continue
+                else:
+                    string_count = 6  # Guitar and other melodic instruments
+                    tuning = [0, 0, 0, 0, 0, 0]  # 6-string guitar E standard
+
+                # Transcribe notes for this arrangement if requested
+                rs_notes = []
+                if transcribe_notes:
+                    print(f"[Editor] Transcribing {stem_name}...")
+                    rs_notes = _midi_events_to_notes(
+                        _transcribe_with_basic_pitch(str(stem_path)),
+                        string_count
+                    )
+                    print(f"[Editor] Transcribed {len(rs_notes)} notes from {stem_name}")
+
+                # Generate beats (4/4 time)
+                num_beats = max(4, int(duration / beat_duration) + 1)
+                beats = []
+                measure_num = 1
+                for i in range(num_beats):
+                    t = 0.5 + i * beat_duration  # Start at 0.5 like RS XMLs
+                    is_measure_start = (i % 4 == 0)
+                    beats.append(Beat(time=t, measure=measure_num if is_measure_start else -1))
+                    if is_measure_start and i > 0:
+                        measure_num += 1
+
+                # Create XML
+                root = XET.Element("song", version="7")
+                XET.SubElement(root, "title").text = title
+                XET.SubElement(root, "arrangement").text = arr_name.capitalize()
+                XET.SubElement(root, "offset").text = "0.000"
+                XET.SubElement(root, "songLength").text = f"{duration:.3f}"
+                XET.SubElement(root, "startBeat").text = "0.500"
+                XET.SubElement(root, "averageTempo").text = str(bpm)
+                XET.SubElement(root, "artistName").text = artist
+                XET.SubElement(root, "albumName").text = album or ""
+                XET.SubElement(root, "albumYear").text = year_str or ""
+
+                # Tuning
+                tuning_elem = XET.SubElement(root, "tuning")
+                for i in range(6):  # Always 6 strings for RS XML
+                    tuning_elem.set(f"string{i}", str(tuning[i] if i < len(tuning) else 0))
+                XET.SubElement(root, "capo").text = "0"
+
+                # Beats
+                ebeats = XET.SubElement(root, "ebeats", count=str(len(beats)))
+                for beat in beats:
+                    XET.SubElement(ebeats, "ebeat", time=f"{beat.time:.3f}", measure=str(beat.measure))
+
+                # Sections
+                sections_elem = XET.SubElement(root, "sections", count="1")
+                XET.SubElement(sections_elem, "section", name="default", number="1", startTime="0.000")
+
+                # Phrases
+                phrases_elem = XET.SubElement(root, "phrases", count="1")
+                XET.SubElement(phrases_elem, "phrase", disparity="0", ignore="0", maxDifficulty="0", name="default", solo="0")
+
+                # Phrase iterations
+                pi_elem = XET.SubElement(root, "phraseIterations", count="1")
+                XET.SubElement(pi_elem, "phraseIteration", time="0.000", phraseId="0")
+
+                # Chord templates (empty for now)
+                XET.SubElement(root, "chordTemplates", count="0")
+
+                # Levels with notes
+                levels_elem = XET.SubElement(root, "levels", count="1")
+                level = XET.SubElement(levels_elem, "level", difficulty="0")
+
+                # Notes
+                notes_elem = XET.SubElement(level, "notes", count=str(len(rs_notes)))
+                for note in rs_notes:
+                    XET.SubElement(notes_elem, "note",
+                                   time=f"{note.time:.3f}",
+                                   string=str(note.string),
+                                   fret=str(note.fret),
+                                   sustain=f"{note.sustain:.3f}")
+
+                # Chords (empty)
+                XET.SubElement(level, "chords", count="0")
+
+                # Anchors (minimal)
+                anchors_elem = XET.SubElement(level, "anchors", count="1")
+                XET.SubElement(anchors_elem, "anchor", time="0.000", fret="1", width="4")
+
+                # Hand shapes (empty)
+                XET.SubElement(level, "handShapes", count="0")
+
+                # Write XML
+                xml_filename = f"{arr_name.capitalize()}_arr.xml"
+                xml_path = Path(tmp) / xml_filename
+                tree = XET.ElementTree(root)
+                XET.indent(tree, space="  ")
+                tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+                xml_paths.append(str(xml_path))
+                print(f"[Editor] Generated XML: {xml_path} with {len(rs_notes)} notes")
+
+            # Parse XMLs into Song object for the editor
+            from lib.song import parse_arrangement
+            song = Song()
+            song.title = title
+            song.artist = artist
+            song.album = album
+            if year_str:
+                try:
+                    song.year = int(year_str)
+                except ValueError:
+                    pass
+            song.song_length = duration
+            song.beats = beats
+            song.sections = [Section(name="default", number=1, start_time=0.0)]
+
+            # Parse the XML files we just created
+            for xml_path in xml_paths:
+                arr = parse_arrangement(xml_path)
+                song.arrangements.append(arr)
+
+            result = _song_to_dict(song, audio_url)
+            return result, tmp, xml_paths
+
+        try:
+            result, session_dir, xml_files = await asyncio.get_event_loop().run_in_executor(None, _transcribe)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, 500)
+
+        session_id = f"transcribe_{re.sub(r'[^a-z0-9]', '', (title or 'new').lower())[:30]}"
+        if session_id in sessions:
+            old = sessions[session_id]
+            shutil.rmtree(old["dir"], ignore_errors=True)
+
+        sessions[session_id] = {
+            "dir": session_dir,
+            "audio_file": None,
+            "filename": "",
+            "xml_files": xml_files,  # Now includes the XMLs!
+            "create_mode": True,
+            "gp_path": str(Path(session_dir) / "transcribed.gp5"),  # Store GP path
+            "metadata": {
+                "title": title, "artist": artist,
+                "album": album, "year": year_str,
+            },
+            "last_touched": time.time(),
+        }
+
+        result["session_id"] = session_id
+        result["create_mode"] = True
+        return result

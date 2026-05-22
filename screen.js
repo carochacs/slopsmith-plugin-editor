@@ -2643,6 +2643,8 @@ window.editorShowCreateModal = () => {
     createState = { gpPath: null, tracks: null, audioUrl: null, audioMode: 'file', artPath: null };
     document.getElementById('editor-create-modal').classList.remove('hidden');
     document.getElementById('editor-create-tracks').classList.add('hidden');
+    // Show transcription options by default (since GP file starts empty)
+    document.getElementById('editor-create-transcribe-options').classList.remove('hidden');
     document.getElementById('editor-create-go').disabled = true;
     document.getElementById('editor-create-status').textContent = '';
     document.getElementById('editor-audio-status').textContent = '';
@@ -2671,7 +2673,21 @@ window.editorSetAudioMode = (mode) => {
 };
 
 window.editorGPFileSelected = async (input) => {
-    if (!input.files.length) return;
+    const transcribeOptions = document.getElementById('editor-create-transcribe-options');
+
+    if (!input.files.length) {
+        // No GP file selected - show transcription options
+        document.getElementById('editor-create-tracks').classList.add('hidden');
+        transcribeOptions.classList.remove('hidden');
+        createState.gpPath = null;
+        createState.tracks = [];
+        updateCreateButton();
+        return;
+    }
+
+    // GP file selected - hide transcription options
+    transcribeOptions.classList.add('hidden');
+
     const file = input.files[0];
     const status = document.getElementById('editor-create-status');
     status.textContent = 'Uploading Guitar Pro file...';
@@ -2778,19 +2794,114 @@ function updateCreateButton() {
     const hasAudio = createState.audioMode === 'youtube'
         ? !!document.getElementById('editor-create-yt-url').value.trim()
         : !!(document.getElementById('editor-create-audio').files || []).length;
-    document.getElementById('editor-create-go').disabled = !hasGP;
+    // Enable button if we have GP file OR if we have audio (for transcription mode)
+    document.getElementById('editor-create-go').disabled = !(hasGP || hasAudio);
+}
+
+// Parse YouTube title and auto-fill metadata fields
+function parseYouTubeTitleForMetadata(title) {
+    if (!title) return null;
+
+    // Common patterns:
+    // "Artist - Title"
+    // "Artist - Title (Official Video)"
+    // "Artist - Title [Official Audio]"
+    // "Title by Artist"
+    // "Artist: Title"
+
+    // Remove common suffixes
+    title = title
+        .replace(/\s*\([^)]*official[^)]*\)/gi, '')
+        .replace(/\s*\[[^\]]*official[^\]]*\]/gi, '')
+        .replace(/\s*\([^)]*video[^)]*\)/gi, '')
+        .replace(/\s*\[[^\]]*audio[^\]]*\]/gi, '')
+        .replace(/\s*\([^)]*lyric[^)]*\)/gi, '')
+        .replace(/\s*\[[^\]]*lyric[^\]]*\]/gi, '')
+        .trim();
+
+    // Try "Artist - Title" pattern
+    let match = title.match(/^(.+?)\s*[-–—]\s*(.+)$/);
+    if (match) {
+        return { artist: match[1].trim(), title: match[2].trim() };
+    }
+
+    // Try "Title by Artist" pattern
+    match = title.match(/^(.+?)\s+by\s+(.+)$/i);
+    if (match) {
+        return { artist: match[2].trim(), title: match[1].trim() };
+    }
+
+    // Try "Artist: Title" pattern
+    match = title.match(/^(.+?)\s*:\s*(.+)$/);
+    if (match) {
+        return { artist: match[1].trim(), title: match[2].trim() };
+    }
+
+    // Fallback: use entire string as title
+    return { artist: '', title: title };
+}
+
+// Auto-fill metadata when YouTube URL is pasted in Create modal
+async function autoFillMetadataFromYouTube(url, targetFields) {
+    if (!url) return;
+
+    try {
+        const resp = await fetch('/api/plugins/editor/youtube-audio', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url }),
+        });
+        const data = await resp.json();
+
+        if (data.title && targetFields) {
+            const parsed = parseYouTubeTitleForMetadata(data.title);
+            if (parsed) {
+                if (targetFields.title && !targetFields.title.value) {
+                    targetFields.title.value = parsed.title;
+                }
+                if (targetFields.artist && !targetFields.artist.value) {
+                    targetFields.artist.value = parsed.artist;
+                }
+            }
+        }
+
+        // Store thumbnail URL and audio URL for later use
+        if (data.audio_url) {
+            createState.audioUrl = data.audio_url;
+        }
+        if (data.thumbnail_url) {
+            createState.thumbnailUrl = data.thumbnail_url;
+        }
+    } catch (e) {
+        console.error('Failed to fetch YouTube metadata:', e);
+    }
 }
 
 // Wire up input change events for enabling the create button
 document.addEventListener('change', (e) => {
     if (e.target.id === 'editor-create-audio') updateCreateButton();
 });
+
+let ytUrlDebounce = null;
 document.addEventListener('input', (e) => {
-    if (e.target.id === 'editor-create-yt-url') updateCreateButton();
+    if (e.target.id === 'editor-create-yt-url') {
+        updateCreateButton();
+
+        // Debounce auto-fill to avoid excessive API calls
+        clearTimeout(ytUrlDebounce);
+        ytUrlDebounce = setTimeout(() => {
+            const url = e.target.value.trim();
+            if (url && (url.includes('youtube.com') || url.includes('youtu.be'))) {
+                autoFillMetadataFromYouTube(url, {
+                    title: document.getElementById('editor-create-title'),
+                    artist: document.getElementById('editor-create-artist'),
+                });
+            }
+        }, 1000);
+    }
 });
 
 window.editorDoCreate = async () => {
-    if (!createState.gpPath) return;
     const status = document.getElementById('editor-create-status');
     const btn = document.getElementById('editor-create-go');
     btn.disabled = true;
@@ -2805,27 +2916,64 @@ window.editorDoCreate = async () => {
         if (!ok) { btn.disabled = false; return; }
     }
 
-    // Get selected track indices
-    const checkboxes = document.querySelectorAll('#editor-create-track-list input[type=checkbox]:checked:not(:disabled)');
-    const trackIndices = [...checkboxes].map(cb => parseInt(cb.value));
-
-    status.textContent = 'Converting Guitar Pro to Rocksmith...';
+    // Check if we're in transcription mode (no GP file)
+    const isTranscriptionMode = !createState.gpPath;
 
     try {
-        const resp = await fetch('/api/plugins/editor/convert-gp', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                gp_path: createState.gpPath,
-                audio_url: createState.audioUrl || '',
-                track_indices: trackIndices.length ? trackIndices : null,
-                title: document.getElementById('editor-create-title').value || 'Untitled',
-                artist: document.getElementById('editor-create-artist').value || 'Unknown',
-                album: document.getElementById('editor-create-album').value || '',
-                year: document.getElementById('editor-create-year').value || '',
-            }),
-        });
-        const data = await resp.json();
+        let data;
+
+        if (isTranscriptionMode) {
+            // Audio-only transcription mode
+            const splitStems = document.getElementById('editor-split-stems').checked;
+            const transcribeNotes = document.getElementById('editor-transcribe-notes').checked;
+
+            if (!hasAudioInput) {
+                status.textContent = 'Error: Audio file or YouTube URL required for transcription';
+                btn.disabled = false;
+                return;
+            }
+
+            status.textContent = splitStems
+                ? 'Splitting stems and transcribing notes...'
+                : 'Transcribing notes from audio...';
+
+            const resp = await fetch('/api/plugins/editor/transcribe-audio', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    audio_url: createState.audioUrl || '',
+                    split_stems: splitStems,
+                    transcribe_notes: transcribeNotes,
+                    title: document.getElementById('editor-create-title').value || 'Untitled',
+                    artist: document.getElementById('editor-create-artist').value || 'Unknown',
+                    album: document.getElementById('editor-create-album').value || '',
+                    year: document.getElementById('editor-create-year').value || '',
+                }),
+            });
+            data = await resp.json();
+        } else {
+            // GP file mode
+            const checkboxes = document.querySelectorAll('#editor-create-track-list input[type=checkbox]:checked:not(:disabled)');
+            const trackIndices = [...checkboxes].map(cb => parseInt(cb.value));
+
+            status.textContent = 'Converting Guitar Pro to Rocksmith...';
+
+            const resp = await fetch('/api/plugins/editor/convert-gp', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    gp_path: createState.gpPath,
+                    audio_url: createState.audioUrl || '',
+                    track_indices: trackIndices.length ? trackIndices : null,
+                    title: document.getElementById('editor-create-title').value || 'Untitled',
+                    artist: document.getElementById('editor-create-artist').value || 'Unknown',
+                    album: document.getElementById('editor-create-album').value || '',
+                    year: document.getElementById('editor-create-year').value || '',
+                }),
+            });
+            data = await resp.json();
+        }
+
         if (data.error) { status.textContent = 'Error: ' + data.error; btn.disabled = false; return; }
 
         // Load into editor
@@ -2925,6 +3073,13 @@ window.editorBuild = async () => {
         } catch (_) {}
     }
 
+    // Use thumbnail as fallback if no art was uploaded
+    let artPath = createState.artPath || '';
+    let thumbnailUrl = '';
+    if (!artPath && createState.thumbnailUrl) {
+        thumbnailUrl = createState.thumbnailUrl;
+    }
+
     try {
         const resp = await fetch('/api/plugins/editor/build', {
             method: 'POST',
@@ -2935,7 +3090,8 @@ window.editorBuild = async () => {
                 beats: S.beats,
                 sections: S.sections,
                 audio_url: createState.audioUrl || '',
-                art_path: createState.artPath || '',
+                art_path: artPath,
+                thumbnail_url: thumbnailUrl,
                 metadata: {
                     title: S.title,
                     artist: S.artist,

@@ -132,12 +132,13 @@
             <button onclick="editorHideCreateModal()" class="text-gray-500 hover:text-white">&times;</button>
         </div>
         <div class="p-4 space-y-4">
-            <!-- Step 1: Guitar Pro file -->
+            <!-- Step 1: Guitar Pro file (optional) -->
             <div>
-                <label class="text-xs font-medium text-gray-400 mb-1 block">Guitar Pro File (.gp3/.gp4/.gp5)</label>
-                <input type="file" id="editor-create-gp" accept=".gp3,.gp4,.gp5,.gpx,.gp"
+                <label class="text-xs font-medium text-gray-400 mb-1 block">Guitar Pro File (optional)</label>
+                <input type="file" id="editor-create-gp" accept=".gp3,.gp4/.gp5,.gpx,.gp"
                     onchange="editorGPFileSelected(this)"
                     class="w-full text-xs text-gray-400 file:mr-3 file:py-1 file:px-3 file:rounded file:border-0 file:text-xs file:bg-dark-600 file:text-gray-300 hover:file:bg-dark-500">
+                <p class="text-xs text-gray-500 mt-1">Leave empty to auto-transcribe from audio</p>
             </div>
 
             <!-- Track selection (shown after GP upload) -->
@@ -145,6 +146,21 @@
                 <label class="text-xs font-medium text-gray-400 mb-1 block">Select Tracks</label>
                 <div id="editor-create-track-list" class="space-y-1 max-h-32 overflow-y-auto bg-dark-800 rounded p-2">
                 </div>
+            </div>
+
+            <!-- Auto-transcription options (shown when no GP file) -->
+            <div id="editor-create-transcribe-options" class="hidden space-y-2 p-3 bg-dark-800 rounded">
+                <label class="flex items-center space-x-2">
+                    <input type="checkbox" id="editor-split-stems" checked class="form-checkbox">
+                    <span class="text-xs">Split into stems (guitar, bass, drums, vocals)</span>
+                </label>
+                <label class="flex items-center space-x-2">
+                    <input type="checkbox" id="editor-transcribe-notes" checked class="form-checkbox">
+                    <span class="text-xs">Auto-detect notes and generate arrangements</span>
+                </label>
+                <p class="text-xs text-gray-500 mt-2">
+                    ⚠️ Note detection is AI-based and may require manual corrections
+                </p>
             </div>
 
             <!-- Step 2: Audio source -->
