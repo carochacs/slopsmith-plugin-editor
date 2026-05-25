@@ -3248,7 +3248,25 @@ window.editorBuild = async () => {
         });
         const data = await resp.json();
         if (data.error) { setStatus('Build error: ' + data.error); return; }
-        setStatus('CDLC built: ' + data.path);
+        setStatus('CDLC built: ' + data.path + ' — rescanning library…');
+
+        // Background rescan so the new song appears in the library immediately.
+        (async () => {
+            try {
+                await fetch('/api/rescan', { method: 'POST' });
+                const poll = setInterval(async () => {
+                    const sr = await fetch('/api/scan-status');
+                    const sd = await sr.json();
+                    if (!sd.running) {
+                        clearInterval(poll);
+                        loadLibrary();
+                        setStatus('CDLC built: ' + data.path + ' — library refreshed!');
+                    }
+                }, 1000);
+            } catch (_) {
+                setStatus('CDLC built: ' + data.path + ' (library may need a manual rescan)');
+            }
+        })();
     } catch (e) {
         setStatus('Build failed: ' + e.message);
     } finally {

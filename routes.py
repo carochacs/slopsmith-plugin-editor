@@ -3041,7 +3041,7 @@ def setup(app, context):
     @app.post("/api/plugins/editor/transcribe-audio")
     async def transcribe_audio(data: dict):
         """Transcribe audio into arrangements using stem separation and basic-pitch."""
-        from lib.song import Song, Beat, Section, Arrangement, Note
+        from lib.song import Song, Beat, Section, Arrangement, Note, Chord
         from lib.sloppak_convert import split_sloppak_stems, demucs_available
 
         def _transcribe_with_basic_pitch(stem_path: str) -> list:
@@ -3272,30 +3272,59 @@ def setup(app, context):
             bpm = 120
             beat_duration = 60.0 / bpm
 
+            def _detect_chords_from_notes(notes: list, chord_time_window: float = 0.05) -> list:
+                """Cluster notes by temporal proximity into chords.
+                Notes within `chord_time_window` of the first note in their cluster
+                are grouped into the same chord.
+                """
+                sorted_notes = sorted(notes, key=lambda n: n.time)
+                chords: list[list] = []
+                for note in sorted_notes:
+                    placed = False
+                    for chord_notes in chords:
+                        if abs(note.time - chord_notes[0].time) <= chord_time_window:
+                            chord_notes.append(note)
+                            placed = True
+                            break
+                    if not placed:
+                        chords.append([note])
+                # Convert to Chord objects (imported at module level)
+                return [Chord(time=ch[0].time, chord_id=i, notes=ch, high_density=len(ch) >= 4)
+                        for i, ch in enumerate(chords)]
+
             xml_paths = []
 
-            # Create one XML file per stem
+            # ── Pass 1: transcribe stems, collect only those with detected notes ──
+            transcribed_stems = []  # [(stem_path, stem_name, arr_name, rs_notes, string_count, tuning, arr_lower, rs_chords)]
+
             for stem_idx, (stem_path, stem_name) in enumerate(stem_files):
                 arr_name = stem_name.replace(".ogg", "")
                 arr_lower = arr_name.lower()
+
+                # Skip drums — percussive transcription needs different approach
+                if arr_lower == "drums":
+                    print(f"[Editor] Skipping drums stem (not yet supported for transcription)")
+                    continue
+
+                # Only transcribe piano when the piano.ogg stem is actually available
+                if arr_lower == "piano" and not (stems_dir / "piano.ogg").exists():
+                    print(f"[Editor] Skipping piano: piano.ogg not available from stem split")
+                    continue
 
                 # Determine instrument type and string count
                 if arr_lower == "bass":
                     string_count = 4
                     tuning = [-4, -9, -14, -19]  # 4-string bass E standard
-                elif arr_lower in ["piano", "vocals", "other"]:
+                elif arr_lower == "piano":
                     string_count = 6  # Map to 6-string for wider range
-                    tuning = [0, 0, 0, 0, 0, 0]  # Standard tuning
-                elif arr_lower == "drums":
-                    # Skip drums - percussive transcription needs different approach
-                    print(f"[Editor] Skipping drums stem (not yet supported for transcription)")
-                    continue
-                else:
-                    string_count = 6  # Guitar and other melodic instruments
-                    tuning = [0, 0, 0, 0, 0, 0]  # 6-string guitar E standard
+                    tuning = [0, 0, 0, 0, 0, 0]
+                else:  # guitar and other melodic instruments
+                    string_count = 6
+                    tuning = [0, 0, 0, 0, 0, 0]
 
-                # Transcribe notes for this arrangement if requested
+                # Transcribe notes for this stem
                 rs_notes = []
+                rs_chords: list = []
                 if transcribe_notes:
                     print(f"[Editor] Transcribing {stem_name}...")
                     rs_notes = _midi_events_to_notes(
@@ -3303,6 +3332,23 @@ def setup(app, context):
                         string_count
                     )
                     print(f"[Editor] Transcribed {len(rs_notes)} notes from {stem_name}")
+
+                    # Detect chords from guitar stem (rhythm guitar)
+                    if arr_lower == "guitar" and rs_notes:
+                        rs_chords = _detect_chords_from_notes(rs_notes)
+                        print(f"[Editor] Detected {len(rs_chords)} chords from {stem_name}")
+
+                # Only keep stems where transcription actually detected notes
+                if not rs_notes:
+                    print(f"[Editor] No notes detected from {stem_name}, skipping")
+                    continue
+
+                transcribed_stems.append((stem_path, stem_name, arr_name, rs_notes, string_count, tuning, arr_lower, rs_chords))
+
+            # ── Pass 2: generate XML only for stems with detected notes ──
+            for stem_path, stem_name, arr_name, rs_notes, string_count, tuning, arr_lower, rs_chords in transcribed_stems:
+                # Guitar → "Rhythm" (RS convention: rhythm guitar = rhythm arrangement)
+                display_name = "Rhythm" if arr_lower == "guitar" else arr_name.capitalize()
 
                 # Generate beats (4/4 time)
                 num_beats = max(4, int(duration / beat_duration) + 1)
@@ -3318,7 +3364,7 @@ def setup(app, context):
                 # Create XML
                 root = XET.Element("song", version="7")
                 XET.SubElement(root, "title").text = title
-                XET.SubElement(root, "arrangement").text = arr_name.capitalize()
+                XET.SubElement(root, "arrangement").text = display_name
                 XET.SubElement(root, "offset").text = "0.000"
                 XET.SubElement(root, "songLength").text = f"{duration:.3f}"
                 XET.SubElement(root, "startBeat").text = "0.500"
@@ -3366,8 +3412,34 @@ def setup(app, context):
                                    fret=str(note.fret),
                                    sustain=f"{note.sustain:.3f}")
 
-                # Chords (empty)
-                XET.SubElement(level, "chords", count="0")
+                # Chords
+                if rs_chords:
+                    chords_elem = XET.SubElement(level, "chords", count=str(len(rs_chords)))
+                    for ch_idx, chord in enumerate(rs_chords):
+                        chord_el = XET.SubElement(chords_elem, "chord",
+                                                   time=f"{chord.time:.3f}",
+                                                   chordId=str(ch_idx),
+                                                   highDensity="1" if chord.high_density else "0",
+                                                   strum="down")
+                        for cn in chord.notes:
+                            XET.SubElement(chord_el, "chordNote",
+                                           time=f"{cn.time:.3f}",
+                                           string=str(cn.string),
+                                           fret=str(cn.fret),
+                                           sustain=f"{cn.sustain:.3f}",
+                                           bend="0",
+                                           hammerOn="0", pullOff="0",
+                                           slideTo="-1", slideUnpitchTo="-1",
+                                           harmonic="0", harmonicPinch="0",
+                                           palmMute="1" if cn.palm_mute else "0",
+                                           mute="1" if cn.mute else "0",
+                                           accent="1" if cn.accent else "0",
+                                           tap="1" if cn.tap else "0",
+                                           tremolo="1" if cn.tremolo else "0",
+                                           pullOffGraceNotes="-1",
+                                           slideGraceNotes="-1")
+                else:
+                    XET.SubElement(level, "chords", count="0")
 
                 # Anchors (minimal)
                 anchors_elem = XET.SubElement(level, "anchors", count="1")
@@ -3377,7 +3449,9 @@ def setup(app, context):
                 XET.SubElement(level, "handShapes", count="0")
 
                 # Write XML
-                xml_filename = f"{arr_name.capitalize()}_arr.xml"
+                xml_filename = f"{display_name}_arr.xml"
+                # Internal name: guitar → Rhythm (matching display name)
+                internal_name = display_name
                 xml_path = Path(tmp) / xml_filename
                 tree = XET.ElementTree(root)
                 XET.indent(tree, space="  ")
