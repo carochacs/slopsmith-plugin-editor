@@ -2887,16 +2887,26 @@ window.editorGPFileSelected = async (input) => {
 // null silently in that case so its callers can decide whether to show a
 // message — `uploadCreateAudio`'s caller prechecks; the replace flow shows
 // a "Choose a file" hint).
-async function _uploadAudioForMode({ mode, ytInputId, fileInputId, statusEl }) {
+async function _uploadAudioForMode({ mode, ytInputId, fileInputId, statusEl, ytPrefix = '' }) {
     if (mode === 'youtube') {
         const url = document.getElementById(ytInputId).value.trim();
         if (!url) return null;
+        const startVal = document.getElementById(`${ytPrefix}yt-start`).value;
+        const endVal = document.getElementById(`${ytPrefix}yt-end`).value;
+        const params = { url };
+        const startSec = parseFloat(startVal) || 0;
+        if (endVal && parseFloat(endVal) > startSec) {
+            params.end_time = parseFloat(endVal);
+        }
+        if (startSec > 0) {
+            params.start_time = startSec;
+        }
         statusEl.textContent = 'Downloading from YouTube...';
         try {
             const resp = await fetch('/api/plugins/editor/youtube-audio', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url }),
+                body: JSON.stringify(params),
             });
             const data = await resp.json();
             if (data.error) { statusEl.textContent = 'Error: ' + data.error; return null; }
@@ -2930,6 +2940,7 @@ async function uploadCreateAudio() {
         ytInputId: 'editor-create-yt-url',
         fileInputId: 'editor-create-audio',
         statusEl: document.getElementById('editor-audio-status'),
+        ytPrefix: 'editor-create-',
     });
     if (!url) return false;
     createState.audioUrl = url;
@@ -3012,10 +3023,11 @@ async function autoFillMetadataFromYouTube(url, targetFields) {
             }
         }
 
-        // Store thumbnail URL and audio URL for later use
-        if (data.audio_url) {
-            createState.audioUrl = data.audio_url;
-        }
+        // Store thumbnail for preview; don't set audioUrl here since
+        // auto-fill has no start/end times — it would point to the
+        // full-length track instead of the trimmed one the user
+        // selected.  _uploadAudioForMode handles audioUrl when the
+        // user actually submits the Create form.
         if (data.thumbnail_url) {
             createState.thumbnailUrl = data.thumbnail_url;
         }
@@ -3084,18 +3096,30 @@ window.editorDoCreate = async () => {
                 ? 'Splitting stems and transcribing notes...'
                 : 'Transcribing notes from audio...';
 
+            // Read YouTube start/end times if YouTube mode
+            let ytStartTime = undefined, ytEndTime = undefined;
+            if (createState.audioMode === 'youtube') {
+                const sVal = document.getElementById('editor-create-yt-start').value;
+                const eVal = document.getElementById('editor-create-yt-end').value;
+                if (sVal && parseFloat(sVal) > 0) ytStartTime = parseFloat(sVal);
+                if (eVal && parseFloat(eVal) > 0) ytEndTime = parseFloat(eVal);
+            }
+            const transcribeBody = {
+                audio_url: createState.audioUrl || '',
+                split_stems: splitStems,
+                transcribe_notes: transcribeNotes,
+                title: document.getElementById('editor-create-title').value || 'Untitled',
+                artist: document.getElementById('editor-create-artist').value || 'Unknown',
+                album: document.getElementById('editor-create-album').value || '',
+                year: document.getElementById('editor-create-year').value || '',
+            };
+            if (ytStartTime !== undefined) transcribeBody.start_time = ytStartTime;
+            if (ytEndTime !== undefined) transcribeBody.end_time = ytEndTime;
+
             const resp = await fetch('/api/plugins/editor/transcribe-audio', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    audio_url: createState.audioUrl || '',
-                    split_stems: splitStems,
-                    transcribe_notes: transcribeNotes,
-                    title: document.getElementById('editor-create-title').value || 'Untitled',
-                    artist: document.getElementById('editor-create-artist').value || 'Unknown',
-                    album: document.getElementById('editor-create-album').value || '',
-                    year: document.getElementById('editor-create-year').value || '',
-                }),
+                body: JSON.stringify(transcribeBody),
             });
             data = await resp.json();
         } else {
@@ -3326,6 +3350,7 @@ async function _uploadReplaceAudio() {
         ytInputId: 'editor-replace-yt-url',
         fileInputId: 'editor-replace-audio',
         statusEl,
+        ytPrefix: 'editor-replace-',
     });
 }
 

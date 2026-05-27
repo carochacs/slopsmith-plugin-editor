@@ -181,6 +181,18 @@
                 <div id="editor-audio-yt-input" class="hidden">
                     <input type="text" id="editor-create-yt-url" placeholder="https://youtube.com/watch?v=..."
                         class="w-full bg-dark-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-300 outline-none focus:border-accent/50">
+                    <div class="flex gap-2 mt-1.5">
+                        <div class="flex-1">
+                            <label class="text-xs text-gray-500 block mb-0.5">Start (seconds)</label>
+                            <input type="number" id="editor-create-yt-start" placeholder="0" min="0"
+                                class="w-full bg-dark-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 outline-none focus:border-accent/50">
+                        </div>
+                        <div class="flex-1">
+                            <label class="text-xs text-gray-500 block mb-0.5">End (seconds)</label>
+                            <input type="number" id="editor-create-yt-end" placeholder="End (leave empty for full)" min="0"
+                                class="w-full bg-dark-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 outline-none focus:border-accent/50">
+                        </div>
+                    </div>
                 </div>
                 <div id="editor-audio-status" class="text-xs text-gray-500 mt-1"></div>
             </div>
@@ -249,6 +261,18 @@
                 <div id="editor-replace-audio-yt-input" class="hidden">
                     <input type="text" id="editor-replace-yt-url" placeholder="https://youtube.com/watch?v=..."
                         class="w-full bg-dark-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-300 outline-none focus:border-accent/50">
+                    <div class="flex gap-2 mt-1.5">
+                        <div class="flex-1">
+                            <label class="text-xs text-gray-500 block mb-0.5">Start (seconds)</label>
+                            <input type="number" id="editor-replace-yt-start" placeholder="0" min="0"
+                                class="w-full bg-dark-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 outline-none focus:border-accent/50">
+                        </div>
+                        <div class="flex-1">
+                            <label class="text-xs text-gray-500 block mb-0.5">End (seconds)</label>
+                            <input type="number" id="editor-replace-yt-end" placeholder="End (leave empty for full)" min="0"
+                                class="w-full bg-dark-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 outline-none focus:border-accent/50">
+                        </div>
+                    </div>
                 </div>
                 <div id="editor-replace-audio-status" class="text-xs text-gray-500 mt-1"></div>
             </div>

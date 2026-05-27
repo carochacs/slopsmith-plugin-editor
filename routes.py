@@ -1280,12 +1280,27 @@ def setup(app, context):
         url = data.get("url", "").strip()
         if not url:
             return JSONResponse({"error": "No URL provided"}, 400)
+        start_time = data.get("start_time")
+        end_time = data.get("end_time")
+        if start_time is not None:
+            try:
+                start_time = float(start_time)
+            except (ValueError, TypeError):
+                start_time = None
+        if end_time is not None:
+            try:
+                end_time = float(end_time)
+            except (ValueError, TypeError):
+                end_time = None
+        if start_time is not None and end_time is not None and end_time <= start_time:
+            return JSONResponse({"error": "end_time must be greater than start_time"}, 400)
 
         def _download():
             tmp = tempfile.mkdtemp(prefix="slopsmith_yt_")
             out_template = os.path.join(tmp, "audio.%(ext)s")
             try:
                 import yt_dlp
+                import subprocess
                 opts = {
                     "format": "bestaudio/best",
                     "outtmpl": out_template,
@@ -1302,34 +1317,55 @@ def setup(app, context):
                     title = info.get("title", "audio")
                     thumbnail_url = info.get("thumbnail")
 
-                # Find the output file
+                # Find the downloaded audio file
+                downloaded = None
                 for f in Path(tmp).iterdir():
                     if f.suffix in (".mp3", ".m4a", ".ogg", ".wav"):
-                        audio_id = re.sub(r"[^a-zA-Z0-9_-]", "_", title)[:60]
-                        ext = f.suffix
-                        dest = STORAGE_DIR / f"editor_audio_{audio_id}{ext}"
-                        shutil.copy2(f, dest)
+                        downloaded = f
+                        break
+                if downloaded is None:
+                    raise RuntimeError("No audio file produced")
 
-                        result = {
-                            "audio_url": f"{STORAGE_URL}/editor_audio_{audio_id}{ext}",
-                            "title": title,
-                        }
+                # Trim to specified time range using ffmpeg
+                audio_id = re.sub(r"[^a-zA-Z0-9_-]", "_", title)[:60]
+                ext = downloaded.suffix
+                trimmed = Path(tmp) / f"audio_trimmed{ext}"
+                if start_time is not None or end_time is not None:
+                    print(f"[Editor] Trimming YouTube audio: start={start_time}s, end={end_time}s")
+                    cmd = ["ffmpeg", "-y", "-i", str(downloaded)]
+                    if start_time is not None:
+                        cmd.extend(["-ss", str(start_time)])
+                    if end_time is not None:
+                        duration = end_time - start_time if start_time is not None else end_time
+                        cmd.extend(["-to", str(duration)])
+                    cmd.append(str(trimmed))
+                    subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    downloaded = trimmed
+                    print(f"[Editor] Trim complete: {trimmed.stat().st_size} bytes")
 
-                        # Download thumbnail if available
-                        if thumbnail_url:
-                            try:
-                                import urllib.request
-                                thumb_dest = STORAGE_DIR / f"editor_thumb_{audio_id}.jpg"
-                                urllib.request.urlretrieve(thumbnail_url, thumb_dest)
-                                result["thumbnail_url"] = f"{STORAGE_URL}/editor_thumb_{audio_id}.jpg"
-                            except Exception as e:
-                                print(f"[Editor] Failed to download thumbnail: {e}")
+                # Move trimmed file to storage
+                dest = STORAGE_DIR / f"editor_audio_{audio_id}{ext}"
+                shutil.copy2(downloaded, dest)
 
-                        shutil.rmtree(tmp, ignore_errors=True)
-                        return result
+                result = {
+                    "audio_url": f"{STORAGE_URL}/editor_audio_{audio_id}{ext}",
+                    "title": title,
+                }
+
+                # Download thumbnail if available
+                if thumbnail_url:
+                    try:
+                        import urllib.request
+                        thumb_dest = STORAGE_DIR / f"editor_thumb_{audio_id}.jpg"
+                        urllib.request.urlretrieve(thumbnail_url, thumb_dest)
+                        result["thumbnail_url"] = f"{STORAGE_URL}/editor_thumb_{audio_id}.jpg"
+                    except Exception as e:
+                        print(f"[Editor] Failed to download thumbnail: {e}")
 
                 shutil.rmtree(tmp, ignore_errors=True)
-                raise RuntimeError("No audio file produced")
+                return result
+
+                raise RuntimeError("Unreachable")
             except Exception as e:
                 shutil.rmtree(tmp, ignore_errors=True)
                 raise
@@ -3097,6 +3133,24 @@ def setup(app, context):
             notes.sort(key=lambda n: n.time)
             return notes
 
+        def _midi_events_to_piano_notes(note_events: list) -> list:
+            """Convert MIDI note events to piano/keys Rocksmith Note objects using MIDI encoding."""
+            notes = []
+            for start_time, end_time, pitch, velocity, pitch_bend in note_events:
+                rs_string = pitch // 24
+                rs_fret = pitch % 24
+                duration = end_time - start_time
+                sustain = float(duration) if duration > 0.1 else 0.0
+                note = Note(
+                    time=float(start_time),
+                    string=rs_string,
+                    fret=rs_fret,
+                    sustain=sustain
+                )
+                notes.append(note)
+            notes.sort(key=lambda n: n.time)
+            return notes
+
         def _transcribe_stems_to_arrangements(stem_files: list) -> list:
             """Transcribe audio stems to arrangements using basic-pitch."""
             try:
@@ -3164,6 +3218,20 @@ def setup(app, context):
         artist = data.get("artist", "Unknown")
         album = data.get("album", "")
         year_str = data.get("year", "")
+        start_time = data.get("start_time")
+        end_time = data.get("end_time")
+        if start_time is not None:
+            try:
+                start_time = float(start_time)
+            except (ValueError, TypeError):
+                start_time = None
+        if end_time is not None:
+            try:
+                end_time = float(end_time)
+            except (ValueError, TypeError):
+                end_time = None
+        if start_time is not None and end_time is not None and end_time <= start_time:
+            return JSONResponse({"error": "end_time must be greater than start_time"}, 400)
 
         if not audio_url:
             return JSONResponse({"error": "Audio URL required"}, 400)
@@ -3185,22 +3253,35 @@ def setup(app, context):
             # Copy audio to stems/full.ogg
             full_audio = stems_dir / "full.ogg"
 
-            # Convert to OGG if needed
+            # Convert to OGG if needed, with optional time trimming
             try:
                 if audio_path.suffix.lower() != ".ogg":
                     print(f"[Editor] Converting {audio_path} to OGG...")
-                    # Convert using ffmpeg
-                    result = subprocess.run([
-                        'ffmpeg', '-i', str(audio_path),
-                        '-c:a', 'libvorbis', '-q:a', '5',
-                        '-y', str(full_audio)
-                    ], check=True, capture_output=True, text=True)
+                    cmd = ['ffmpeg', '-y', '-i', str(audio_path), '-c:a', 'libvorbis', '-q:a', '5']
+                    if start_time is not None:
+                        cmd.extend(['-ss', str(start_time)])
+                    if end_time is not None:
+                        duration = end_time - start_time if start_time is not None else end_time
+                        cmd.extend(['-t', str(duration)])
+                    cmd.append(str(full_audio))
+                    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
                     print(f"[Editor] Conversion complete")
                 else:
-                    print(f"[Editor] Copying OGG file {audio_path}...")
-                    # Already OGG, just copy
-                    shutil.copy2(audio_path, full_audio)
-                    print(f"[Editor] Copy complete")
+                    print(f"[Editor] Processing OGG file {audio_path}...")
+                    # Already OGG — may need trimming
+                    if start_time is not None or end_time is not None:
+                        print(f"[Editor] Trimming OGG: start={start_time}s, end={end_time}s")
+                        cmd = ['ffmpeg', '-y', '-i', str(audio_path), '-c:a', 'libvorbis', '-q:a', '5']
+                        if start_time is not None:
+                            cmd.extend(['-ss', str(start_time)])
+                        if end_time is not None:
+                            duration = end_time - start_time if start_time is not None else end_time
+                            cmd.extend(['-t', str(duration)])
+                        cmd.append(str(full_audio))
+                        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    else:
+                        shutil.copy2(audio_path, full_audio)
+                    print(f"[Editor] OGG processing complete")
 
                 if not full_audio.exists():
                     raise FileNotFoundError(f"Audio file was not created at {full_audio}")
@@ -3316,7 +3397,7 @@ def setup(app, context):
                     string_count = 4
                     tuning = [-4, -9, -14, -19]  # 4-string bass E standard
                 elif arr_lower == "piano":
-                    string_count = 6  # Map to 6-string for wider range
+                    string_count = 6  # Piano uses MIDI encoding (string = midi//24)
                     tuning = [0, 0, 0, 0, 0, 0]
                 else:  # guitar and other melodic instruments
                     string_count = 6
@@ -3327,13 +3408,15 @@ def setup(app, context):
                 rs_chords: list = []
                 if transcribe_notes:
                     print(f"[Editor] Transcribing {stem_name}...")
-                    rs_notes = _midi_events_to_notes(
-                        _transcribe_with_basic_pitch(str(stem_path)),
-                        string_count
-                    )
+                    note_events = _transcribe_with_basic_pitch(str(stem_path))
+                    if arr_lower == "piano":
+                        # Piano uses MIDI encoding: string=midi//24, fret=midi%24
+                        rs_notes = _midi_events_to_piano_notes(note_events)
+                    else:
+                        rs_notes = _midi_events_to_notes(note_events, string_count)
                     print(f"[Editor] Transcribed {len(rs_notes)} notes from {stem_name}")
 
-                    # Detect chords from guitar stem (rhythm guitar)
+                    # Detect chords from guitar stem (rhythm guitar) only
                     if arr_lower == "guitar" and rs_notes:
                         rs_chords = _detect_chords_from_notes(rs_notes)
                         print(f"[Editor] Detected {len(rs_chords)} chords from {stem_name}")
