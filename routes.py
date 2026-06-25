@@ -1886,6 +1886,125 @@ def setup(app, context):
 
         return {"arrangement": arr_data, "tmp_dir": tmp_dir, "xml_path": xml_path}
 
+    # ── Import guitar/bass tracks from a GP file ──────────────────────
+
+    @app.post("/api/plugins/editor/import-guitar")
+    async def import_guitar_track(data: dict):
+        """Import a guitar/bass track from a GP file and return as an arrangement."""
+        from lib.gp2rs import convert_track
+        from lib.song import parse_arrangement
+        import guitarpro
+
+        gp_path_raw = data.get("gp_path", "")
+        track_index = data.get("track_index")
+        arrangement_name = data.get("arrangement_name", "Lead").strip() or "Lead"
+        try:
+            audio_offset = float(data.get("audio_offset", 0.0))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "audio_offset must be a number"}, 400)
+
+        validated = _validate_editor_upload_path(gp_path_raw, "slopsmith_gp_")
+        if not validated:
+            return JSONResponse({"error": "GP file not found"}, 400)
+        gp_path = str(validated)
+        if track_index is None:
+            return JSONResponse({"error": "track_index required"}, 400)
+        try:
+            track_index = int(track_index)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "track_index must be an integer"}, 400)
+
+        def _convert():
+            song = guitarpro.parse(gp_path)
+            xml_str = convert_track(song, track_index, audio_offset, arrangement_name)
+
+            tmp = tempfile.mkdtemp(prefix="slopsmith_guitar_")
+            xml_path = os.path.join(tmp, f"{arrangement_name}.xml")
+            Path(xml_path).write_text(xml_str, encoding="utf-8")
+
+            arr = parse_arrangement(xml_path)
+            arr_data = {
+                "name": arrangement_name,
+                "tuning": arr.tuning,
+                "capo": arr.capo,
+                "notes": [],
+                "chords": [],
+                "chord_templates": [],
+            }
+
+            for n in arr.notes:
+                arr_data["notes"].append({
+                    "time": round(n.time, 3),
+                    "string": n.string,
+                    "fret": n.fret,
+                    "sustain": round(n.sustain, 3),
+                    "techniques": {
+                        "bend": n.bend,
+                        "slide_to": n.slide_to,
+                        "slide_unpitch_to": n.slide_unpitch_to,
+                        "hammer_on": n.hammer_on,
+                        "pull_off": n.pull_off,
+                        "harmonic": n.harmonic,
+                        "harmonic_pinch": n.harmonic_pinch,
+                        "palm_mute": n.palm_mute,
+                        "mute": n.mute,
+                        "tremolo": n.tremolo,
+                        "accent": n.accent,
+                        "tap": n.tap,
+                        "link_next": n.link_next,
+                    },
+                })
+
+            for ch in arr.chords:
+                chord_data = {
+                    "time": round(ch.time, 3),
+                    "chord_id": ch.chord_id,
+                    "high_density": ch.high_density,
+                    "notes": [],
+                }
+                for cn in ch.notes:
+                    chord_data["notes"].append({
+                        "time": round(cn.time, 3),
+                        "string": cn.string,
+                        "fret": cn.fret,
+                        "sustain": round(cn.sustain, 3),
+                        "techniques": {
+                            "bend": cn.bend,
+                            "slide_to": cn.slide_to,
+                            "slide_unpitch_to": cn.slide_unpitch_to,
+                            "hammer_on": cn.hammer_on,
+                            "pull_off": cn.pull_off,
+                            "harmonic": cn.harmonic,
+                            "palm_mute": cn.palm_mute,
+                            "mute": cn.mute,
+                            "tremolo": cn.tremolo,
+                            "accent": cn.accent,
+                            "tap": cn.tap,
+                            "link_next": cn.link_next,
+                        },
+                    })
+                arr_data["chords"].append(chord_data)
+
+            for ct in arr.chord_templates:
+                arr_data["chord_templates"].append({
+                    "name": ct.name,
+                    "frets": ct.frets,
+                    "fingers": ct.fingers,
+                })
+
+            return arr_data, tmp, xml_path
+
+        try:
+            arr_data, tmp_dir, xml_path = (
+                await asyncio.get_event_loop().run_in_executor(None, _convert)
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, 500)
+
+        return {"arrangement": arr_data, "tmp_dir": tmp_dir, "xml_path": xml_path}
+
     # ── Import drum/percussion tracks from a GP file ─────────────────
 
     @app.post("/api/plugins/editor/import-drums")

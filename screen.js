@@ -2107,6 +2107,13 @@ function updateArrangementSelector() {
         keysBtn.classList.toggle('hidden', !S.sessionId || S.format !== 'sloppak');
     }
 
+    // Show "+ Guitar" button on sloppak sessions; Lead/Rhythm/Bass/Combo arrangements
+    // can be added at any time, same gate as Keys.
+    const guitarBtn = document.getElementById('editor-add-guitar-btn');
+    if (guitarBtn) {
+        guitarBtn.classList.toggle('hidden', !S.sessionId || S.format !== 'sloppak');
+    }
+
     // Show "⋮ Strings" tuning editor whenever a guitar/bass arrangement is
     // active (not Keys-mode — piano-roll arrangements have no string concept).
     // Available on both PSARC and sloppak; the save-time prompt handles the
@@ -4068,6 +4075,227 @@ window.editorAddEmptyKeys = async () => {
         statusEl.textContent = 'Failed: ' + e.message;
     } finally {
         _addingEmptyKeys = false;
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════
+// Add Guitar / Bass arrangement — GP import or empty start
+// ════════════════════════════════════════════════════════════════════
+
+let _addGuitarSourcePath = null;
+let _addGuitarSortedTracks = [];
+
+function _uniqueGuitarName(base) {
+    const taken = new Set(S.arrangements.map(a => (a.name || '').trim().toLowerCase()));
+    if (!taken.has(base.toLowerCase())) return base;
+    const limit = taken.size + 2;
+    for (let i = 2; i <= limit; i++) {
+        const candidate = `${base} ${i}`;
+        if (!taken.has(candidate.toLowerCase())) return candidate;
+    }
+    return `${base} ${Date.now()}`;
+}
+
+function _guitarArrangementName() {
+    const preset = document.getElementById('editor-add-guitar-preset').value;
+    if (preset === 'custom') {
+        return (document.getElementById('editor-add-guitar-name').value || '').trim() || 'Lead';
+    }
+    return preset;
+}
+
+window.editorGuitarPresetChanged = (val) => {
+    const nameEl = document.getElementById('editor-add-guitar-name');
+    nameEl.classList.toggle('hidden', val !== 'custom');
+    if (val !== 'custom') nameEl.value = '';
+};
+
+window.editorShowAddGuitarModal = () => {
+    if (S.format !== 'sloppak') return;
+    _addGuitarSourcePath = null;
+    _addGuitarSortedTracks = [];
+    document.getElementById('editor-add-guitar-modal').classList.remove('hidden');
+    document.getElementById('editor-add-guitar-tracks').classList.add('hidden');
+    document.getElementById('editor-add-guitar-go').disabled = true;
+    document.getElementById('editor-add-guitar-status').textContent = '';
+    document.getElementById('editor-add-guitar-preset').value = 'Lead';
+    document.getElementById('editor-add-guitar-name').value = '';
+    document.getElementById('editor-add-guitar-name').classList.add('hidden');
+    const fi = document.getElementById('editor-add-guitar-file');
+    if (fi) fi.value = '';
+};
+
+window.editorHideAddGuitarModal = () => {
+    document.getElementById('editor-add-guitar-modal').classList.add('hidden');
+};
+
+window.editorGuitarFileSelected = async (input) => {
+    const file = input.files && input.files[0];
+    if (!file) {
+        _addGuitarSourcePath = null;
+        _addGuitarSortedTracks = [];
+        document.getElementById('editor-add-guitar-go').disabled = true;
+        document.getElementById('editor-add-guitar-tracks').classList.add('hidden');
+        return;
+    }
+
+    const statusEl = document.getElementById('editor-add-guitar-status');
+    statusEl.textContent = 'Parsing ' + file.name + '...';
+    _addGuitarSourcePath = null;
+    _addGuitarSortedTracks = [];
+    document.getElementById('editor-add-guitar-go').disabled = true;
+    document.getElementById('editor-add-guitar-tracks').classList.add('hidden');
+
+    const fd = new FormData();
+    fd.append('file', file);
+
+    try {
+        const resp = await fetch('/api/plugins/editor/import-gp', { method: 'POST', body: fd });
+        const data = await resp.json();
+        if (data.error) { statusEl.textContent = 'Error: ' + data.error; return; }
+
+        const tracks = data.tracks || [];
+        // Surface non-drum tracks; flag piano/keys so users know they're picking a keys track.
+        const guitarTracks = tracks.filter(t => !(t.is_drums || t.is_percussion));
+        if (guitarTracks.length === 0) {
+            statusEl.textContent = 'No guitar/bass tracks found in this file.';
+            return;
+        }
+
+        _addGuitarSourcePath = data.gp_path;
+        _addGuitarSortedTracks = guitarTracks;
+
+        const listEl = document.getElementById('editor-add-guitar-track-list');
+        listEl.innerHTML = guitarTracks.map((t, i) => {
+            const safeName = _editorEscHtml(t.name || '') || _editorEscHtml('Track ' + t.index);
+            const keysTag = t.is_piano ? '<span class="text-indigo-300">[keys]</span>' : '';
+            const checked = i === 0 ? 'checked' : '';
+            return `<label class="flex items-center gap-2 text-xs text-gray-300 py-0.5">
+                <input type="radio" name="guitar-track" value="${i}" ${checked} class="accent-green-500">
+                <span class="text-gray-200">${safeName}</span>
+                ${keysTag}
+                <span class="text-gray-600 ml-auto">${Number(t.strings) || 0}str ${Number(t.notes) || 0} notes</span>
+            </label>`;
+        }).join('');
+        document.getElementById('editor-add-guitar-tracks').classList.remove('hidden');
+        document.getElementById('editor-add-guitar-go').disabled = false;
+        statusEl.textContent = `Found ${guitarTracks.length} track(s). Pick one.`;
+    } catch (e) {
+        statusEl.textContent = 'Failed: ' + e.message;
+    }
+};
+
+window.editorDoAddGuitar = async () => {
+    if (!_addGuitarSourcePath || !S.sessionId) return;
+    const statusEl = document.getElementById('editor-add-guitar-status');
+    const goBtn = document.getElementById('editor-add-guitar-go');
+    goBtn.disabled = true;
+    statusEl.textContent = 'Importing track...';
+
+    const radio = document.querySelector('input[name="guitar-track"]:checked');
+    const pos = radio ? parseInt(radio.value) : 0;
+    const picked = _addGuitarSortedTracks[pos] || _addGuitarSortedTracks[0];
+    if (!picked) { statusEl.textContent = 'No track selected.'; goBtn.disabled = false; return; }
+
+    const arrangementName = _uniqueGuitarName(_guitarArrangementName());
+
+    try {
+        const resp = await fetch('/api/plugins/editor/import-guitar', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                gp_path: _addGuitarSourcePath,
+                track_index: Number(picked.index) || 0,
+                audio_offset: _effectiveAudioOffset(),
+                arrangement_name: arrangementName,
+            }),
+        });
+        const data = await resp.json();
+        if (data.error) {
+            statusEl.textContent = 'Error: ' + data.error;
+            goBtn.disabled = false;
+            return;
+        }
+
+        const addResp = await fetch('/api/plugins/editor/add-arrangement', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                session_id: S.sessionId,
+                arrangement: data.arrangement,
+                xml_path: data.xml_path || '',
+            }),
+        });
+        const addData = await addResp.json().catch(() => ({}));
+        if (!addResp.ok || addData.error) {
+            statusEl.textContent = 'Error registering arrangement: ' + (addData.error || addResp.status);
+            goBtn.disabled = false;
+            return;
+        }
+
+        S.arrangements.push(data.arrangement);
+        S.currentArr = S.arrangements.length - 1;
+        const sel = document.getElementById('editor-arrangement');
+        if (sel) sel.value = S.currentArr;
+
+        flattenChords();
+        updateArrangementSelector();
+        updateStatus();
+        draw();
+
+        editorHideAddGuitarModal();
+        setStatus(`Added ${arrangementName} arrangement (${data.arrangement.notes.length} notes). Save to commit.`);
+    } catch (e) {
+        statusEl.textContent = 'Failed: ' + e.message;
+        goBtn.disabled = false;
+    }
+};
+
+let _addingEmptyGuitar = false;
+
+window.editorAddEmptyGuitar = async () => {
+    if (S.format !== 'sloppak' || !S.sessionId) return;
+    if (_addingEmptyGuitar) return;
+    _addingEmptyGuitar = true;
+    const statusEl = document.getElementById('editor-add-guitar-status');
+    const arrangementName = _uniqueGuitarName(_guitarArrangementName());
+    const isBass = /bass/i.test(arrangementName);
+    const arrangement = {
+        name: arrangementName,
+        tuning: isBass ? [0, 0, 0, 0] : [0, 0, 0, 0, 0, 0],
+        capo: 0,
+        notes: [],
+        chords: [],
+        chord_templates: [],
+    };
+    try {
+        const resp = await fetch('/api/plugins/editor/add-arrangement', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: S.sessionId, arrangement }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data.error) {
+            statusEl.textContent = 'Error registering arrangement: ' + (data.error || resp.status);
+            return;
+        }
+
+        S.arrangements.push(arrangement);
+        S.currentArr = S.arrangements.length - 1;
+        const sel = document.getElementById('editor-arrangement');
+        if (sel) sel.value = S.currentArr;
+
+        flattenChords();
+        updateArrangementSelector();
+        updateStatus();
+        draw();
+
+        editorHideAddGuitarModal();
+        setStatus(`Added empty ${arrangementName} arrangement. Double-click the chart to add notes; save to commit.`);
+    } catch (e) {
+        statusEl.textContent = 'Failed: ' + e.message;
+    } finally {
+        _addingEmptyGuitar = false;
     }
 };
 

@@ -26,6 +26,7 @@
         <button id="editor-build-btn" onclick="editorBuild()" class="px-3 py-1 bg-purple-800 hover:bg-purple-700 rounded text-xs font-medium hidden">Build CDLC</button>
         <button id="editor-add-drums-btn" onclick="editorShowAddDrumsModal()" class="px-3 py-1 bg-red-900 hover:bg-red-800 rounded text-xs font-medium hidden">+ Drums</button>
         <button id="editor-add-keys-btn" onclick="editorShowAddKeysModal()" class="px-3 py-1 bg-indigo-900 hover:bg-indigo-800 rounded text-xs font-medium hidden">+ Keys</button>
+        <button id="editor-add-guitar-btn" onclick="editorShowAddGuitarModal()" class="px-3 py-1 bg-green-900 hover:bg-green-800 rounded text-xs font-medium hidden">+ Guitar</button>
         <button id="editor-strings-btn" onclick="editorShowStringsModal()" class="px-3 py-1 bg-amber-800 hover:bg-amber-700 rounded text-xs font-medium hidden" title="Add or remove strings on the active arrangement (extended-range guitar / bass)">⋮ Strings</button>
         <button id="editor-record-midi-btn" onclick="editorShowRecordMidiModal()" class="px-3 py-1 bg-rose-900 hover:bg-rose-800 rounded text-xs font-medium hidden disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-rose-900" title="Record a Keys arrangement live from a MIDI keyboard (Chrome/Edge)">● Record</button>
 
@@ -374,6 +375,54 @@
                 Start Empty (no source file)
             </button>
             <div id="editor-add-keys-status" class="text-xs text-gray-500"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Add guitar/bass modal -->
+<div id="editor-add-guitar-modal" class="hidden absolute inset-0 z-50 flex items-center justify-center" style="background:rgba(0,0,0,0.7)">
+    <div class="bg-dark-700 rounded-xl border border-gray-700 w-full max-w-md flex flex-col">
+        <div class="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+            <span class="text-sm font-medium">Add Guitar / Bass Arrangement</span>
+            <button onclick="editorHideAddGuitarModal()" class="text-gray-500 hover:text-white">&times;</button>
+        </div>
+        <div class="p-4 space-y-3">
+            <div>
+                <label class="text-xs font-medium text-gray-400 mb-1 block">Arrangement Name</label>
+                <div class="flex gap-2">
+                    <select id="editor-add-guitar-preset" onchange="editorGuitarPresetChanged(this.value)"
+                        class="bg-dark-600 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 outline-none">
+                        <option value="Lead">Lead</option>
+                        <option value="Rhythm">Rhythm</option>
+                        <option value="Bass">Bass</option>
+                        <option value="Combo">Combo</option>
+                        <option value="custom">Custom…</option>
+                    </select>
+                    <input type="text" id="editor-add-guitar-name" placeholder="Arrangement name"
+                        class="flex-1 bg-dark-600 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 outline-none hidden">
+                </div>
+            </div>
+            <div>
+                <label class="text-xs font-medium text-gray-400 mb-1 block">Source File (Guitar Pro) — optional</label>
+                <input type="file" id="editor-add-guitar-file" accept=".gp3,.gp4,.gp5,.gpx,.gp"
+                    onchange="editorGuitarFileSelected(this)"
+                    class="w-full text-xs text-gray-400 file:mr-3 file:py-1 file:px-3 file:rounded file:border-0 file:text-xs file:bg-dark-600 file:text-gray-300 hover:file:bg-dark-500">
+                <p class="text-xs text-gray-600 mt-1">Skip to start with an empty chart you can edit directly.</p>
+            </div>
+            <div id="editor-add-guitar-tracks" class="hidden">
+                <label class="text-xs font-medium text-gray-400 mb-1 block">Select Track</label>
+                <div id="editor-add-guitar-track-list" class="space-y-1 max-h-40 overflow-y-auto bg-dark-800 rounded p-2"></div>
+            </div>
+            <button onclick="editorDoAddGuitar()" id="editor-add-guitar-go"
+                class="w-full px-4 py-2 bg-green-700 hover:bg-green-600 rounded-lg text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                Import Track
+            </button>
+            <div class="text-center text-xs text-gray-600">— or —</div>
+            <button onclick="editorAddEmptyGuitar()"
+                class="w-full px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm font-medium">
+                Start Empty (no source file)
+            </button>
+            <div id="editor-add-guitar-status" class="text-xs text-gray-500"></div>
         </div>
     </div>
 </div>
