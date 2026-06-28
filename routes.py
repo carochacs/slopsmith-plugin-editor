@@ -822,16 +822,42 @@ def setup(app, context):
             # handshapes, and phrases from the loaded session (the editor
             # UI doesn't expose them yet — pass them through verbatim).
             def _build_wire(arr_dict, is_first):
+                arr_notes = arr_dict.get("notes", [])
+                arr_chords = arr_dict.get("chords", [])
+                arr_tuning = arr_dict.get("tuning", [0]*6)
+                arr_cts = arr_dict.get("chord_templates", [])
+
+                # Auto-name unnamed chord templates on save
+                if any(not ct.get("name") for ct in arr_cts):
+                    try:
+                        from lib.chord_analysis import detect_key
+                        all_ns = list(arr_notes)
+                        for ch in arr_chords:
+                            for cn in ch.get("notes", []):
+                                all_ns.append({"string": cn.get("string", 0), "fret": cn.get("fret", 0), "sustain": cn.get("sustain", 0)})
+                        _key = detect_key(all_ns, arr_tuning)
+                        arr_cts = _name_chord_templates(arr_cts, arr_notes, arr_chords, arr_tuning, _key)
+                    except Exception:
+                        pass
+
                 wire = _arr_dict_to_wire(
                     arr_dict.get("name", "arr"),
-                    arr_dict.get("tuning", [0]*6),
+                    arr_tuning,
                     int(arr_dict.get("capo", 0)),
-                    arr_dict.get("notes", []),
-                    arr_dict.get("chords", []),
-                    arr_dict.get("chord_templates", []),
+                    arr_notes,
+                    arr_chords,
+                    arr_cts,
                 )
                 wire["anchors"] = list(arr_dict.get("anchors") or [])
-                wire["handshapes"] = list(arr_dict.get("handshapes") or [])
+                # Auto-generate handshapes when absent
+                saved_hs = list(arr_dict.get("handshapes") or [])
+                if not saved_hs and (arr_notes or arr_chords):
+                    try:
+                        groups = _group_notes_impl(arr_notes, arr_chords, [])
+                        saved_hs = _groups_to_handshapes(groups, arr_cts)
+                    except Exception:
+                        pass
+                wire["handshapes"] = saved_hs
                 ph = arr_dict.get("phrases")
                 if ph:
                     wire["phrases"] = list(ph)
@@ -2408,6 +2434,149 @@ def setup(app, context):
 
         return {"success": True, "arrangement_count": len(session.get("xml_files", []))}
 
+    # ── Generate difficulty levels for sloppak arrangement ───────────
+
+    @app.post("/api/plugins/editor/generate-difficulties")
+    async def generate_difficulties(data: dict):
+        """Generate multi-difficulty phrase ladders for a sloppak arrangement."""
+        session_id = data.get("session_id", "")
+        session = sessions.get(session_id)
+        if not session:
+            return JSONResponse({"error": "No active session"}, 400)
+        if session.get("format") != "sloppak":
+            return JSONResponse({"error": "generate-difficulties only applies to sloppak sessions"}, 400)
+        session["last_touched"] = time.time()
+
+        arrangement_index = data.get("arrangement_index", 0)
+        try:
+            arrangement_index = int(arrangement_index)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "arrangement_index must be an integer"}, 400)
+
+        n_levels = data.get("n_levels", 5)
+        try:
+            n_levels = max(2, min(int(n_levels), 10))
+        except (TypeError, ValueError):
+            n_levels = 5
+
+        # The frontend sends the full arrangement state (which may be dirty)
+        arr_data = data.get("arrangement")
+        if not arr_data:
+            return JSONResponse({"error": "arrangement data required"}, 400)
+
+        notes = arr_data.get("notes", [])
+        chords = arr_data.get("chords", [])
+        handshapes = arr_data.get("handshapes", [])
+        chord_templates = list(arr_data.get("chord_templates", []))
+        tuning = arr_data.get("tuning", [0] * 6)
+        beats = arr_data.get("beats", []) or data.get("beats", [])
+        sections = arr_data.get("sections", []) or data.get("sections", [])
+
+        def _run():
+            from lib.chord_analysis import (
+                detect_key, name_chord, key_name, fret_to_midi,
+            )
+
+            # ── Key detection ─────────────────────────────────────────
+            all_notes = list(notes)
+            for ch in chords:
+                for cn in ch.get("notes", []):
+                    all_notes.append({
+                        "string": cn.get("string", 0),
+                        "fret": cn.get("fret", 0),
+                        "sustain": cn.get("sustain", ch.get("sustain", 0)),
+                    })
+            key = detect_key(all_notes, tuning)
+            detected_key_name = key_name(key)
+
+            # ── Group notes ───────────────────────────────────────────
+            groups = _group_notes_impl(notes, chords, handshapes)
+
+            # ── Score groups ──────────────────────────────────────────
+            _score_groups(groups, tuning)
+
+            # ── Build phrase windows ──────────────────────────────────
+            duration = 0.0
+            for n in notes:
+                end = float(n.get("time", 0)) + float(n.get("sustain", 0))
+                if end > duration:
+                    duration = end
+            for ch in chords:
+                end = float(ch.get("time", 0)) + 0.1
+                if end > duration:
+                    duration = end
+            if duration == 0.0:
+                duration = 30.0
+
+            phrase_windows = []
+            if sections:
+                sorted_secs = sorted(sections, key=lambda s: float(s.get("time", s.get("start_time", 0))))
+                for i, sec in enumerate(sorted_secs):
+                    t_start = float(sec.get("time", sec.get("start_time", 0)))
+                    t_end = float(sorted_secs[i + 1].get("time", sorted_secs[i + 1].get("start_time", 0))) if i + 1 < len(sorted_secs) else duration
+                    phrase_windows.append((t_start, t_end))
+            else:
+                window = 30.0
+                t = 0.0
+                while t < duration:
+                    phrase_windows.append((t, min(t + window, duration)))
+                    t += window
+            if not phrase_windows:
+                phrase_windows = [(0.0, duration)]
+
+            # ── Assign levels per phrase ──────────────────────────────
+            beat_times = [float(b.get("time", 0)) for b in beats]
+            phrases_out = []
+
+            for phrase_idx, (t_start, t_end) in enumerate(phrase_windows):
+                phrase_groups = [g for g in groups if t_start <= g["time"] < t_end]
+                if not phrase_groups:
+                    continue
+                _assign_levels(phrase_groups, n_levels, ramp_up=(phrase_idx == 0))
+                levels_out = []
+                for lvl in range(n_levels):
+                    lvl_notes, lvl_chords = _notes_for_level(phrase_groups, lvl, tuning)
+                    lvl_anchors = _generate_anchors(lvl_notes, beat_times)
+                    lvl_handshapes = _groups_to_handshapes(
+                        [g for g in phrase_groups if g["level"] <= lvl],
+                        chord_templates,
+                    )
+                    levels_out.append({
+                        "difficulty": lvl,
+                        "notes": lvl_notes,
+                        "chords": lvl_chords,
+                        "anchors": lvl_anchors,
+                        "hand_shapes": lvl_handshapes,
+                    })
+                phrases_out.append({
+                    "start_time": round(t_start, 3),
+                    "end_time": round(t_end, 3),
+                    "max_difficulty": n_levels - 1,
+                    "levels": levels_out,
+                })
+
+            # ── Auto-generate base handshapes (max difficulty) ────────
+            top_handshapes = _groups_to_handshapes(groups, chord_templates)
+
+            # ── Name unnamed chord templates ──────────────────────────
+            named_templates = _name_chord_templates(chord_templates, notes, chords, tuning, key)
+
+            return {
+                "key": detected_key_name,
+                "phrases": phrases_out,
+                "handshapes": top_handshapes,
+                "chord_templates": named_templates,
+            }
+
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(None, _run)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, 500)
+
+        return result
+
     # ── Build CDLC from create-mode session ──────────────────────────
 
     @app.post("/api/plugins/editor/build")
@@ -2798,6 +2967,373 @@ def setup(app, context):
             ],
         }
         return wire
+
+    # ── Difficulty generation helpers ─────────────────────────────────
+
+    def _group_notes_impl(notes, chords, handshapes, *, time_window_ms=150, fret_span_max=4):
+        """Group notes into atomic units for difficulty generation.
+
+        Priority: chords → link_next chains → handshape windows
+        → time-proximity clusters → individual notes.
+        Each group: {type, notes, chord, time, score, level}.
+        """
+        groups = []
+        assigned_note_indices = set()
+        assigned_chord_indices = set()
+
+        # 1. Explicit chords
+        for ci, ch in enumerate(chords):
+            assigned_chord_indices.add(ci)
+            groups.append({
+                "type": "chord",
+                "notes": list(ch.get("notes", [])),
+                "chord": ch,
+                "time": float(ch.get("time", 0)),
+                "score": 0.0,
+                "level": 0,
+            })
+
+        # Build index of notes by (string, time) for link_next chaining
+        note_list = [dict(n, _idx=i) for i, n in enumerate(notes)]
+
+        # 2. link_next chains among single notes
+        in_chain = set()
+        for i, n in enumerate(note_list):
+            if i in in_chain:
+                continue
+            tech = n.get("techniques", {}) or {}
+            if not tech.get("link_next", False):
+                continue
+            chain = [n]
+            in_chain.add(i)
+            cur = n
+            # Follow chain: find next note on same string close in time
+            while True:
+                cur_end = float(cur.get("time", 0)) + float(cur.get("sustain", 0))
+                cur_str = cur.get("string", 0)
+                next_n = None
+                for j, m in enumerate(note_list):
+                    if j in in_chain:
+                        continue
+                    if m.get("string", 0) == cur_str and abs(float(m.get("time", 0)) - cur_end) < 0.05:
+                        next_n = (j, m)
+                        break
+                if next_n is None:
+                    break
+                jj, mm = next_n
+                chain.append(mm)
+                in_chain.add(jj)
+                cur = mm
+                cur_tech = mm.get("techniques", {}) or {}
+                if not cur_tech.get("link_next", False):
+                    break
+            if len(chain) > 1:
+                for nn in chain:
+                    assigned_note_indices.add(nn["_idx"])
+                groups.append({
+                    "type": "arpeggio",
+                    "notes": chain,
+                    "chord": None,
+                    "time": float(chain[0].get("time", 0)),
+                    "score": 0.0,
+                    "level": 0,
+                })
+
+        # 3. Handshape windows
+        if handshapes:
+            sorted_hs = sorted(handshapes, key=lambda h: float(h.get("start_time", 0)))
+            for hs in sorted_hs:
+                t_start = float(hs.get("start_time", 0))
+                t_end = float(hs.get("end_time", t_start + 0.5))
+                window_notes = [
+                    n for n in note_list
+                    if n["_idx"] not in assigned_note_indices
+                    and t_start <= float(n.get("time", 0)) < t_end
+                ]
+                if len(window_notes) > 1:
+                    for nn in window_notes:
+                        assigned_note_indices.add(nn["_idx"])
+                    groups.append({
+                        "type": "arpeggio",
+                        "notes": window_notes,
+                        "chord": None,
+                        "time": t_start,
+                        "score": 0.0,
+                        "level": 0,
+                    })
+
+        # 4. Time-proximity clusters
+        remaining = [n for n in note_list if n["_idx"] not in assigned_note_indices]
+        remaining.sort(key=lambda n: float(n.get("time", 0)))
+        used = set()
+        for i, n in enumerate(remaining):
+            if i in used:
+                continue
+            cluster = [n]
+            cluster_strings = {n.get("string", 0)}
+            n_fret = n.get("fret", 0)
+            cluster_frets = [n_fret] if n_fret > 0 else []
+            for j, m in enumerate(remaining[i + 1:], start=i + 1):
+                if j in used:
+                    continue
+                dt_ms = (float(m.get("time", 0)) - float(n.get("time", 0))) * 1000
+                if dt_ms > time_window_ms:
+                    break
+                if m.get("string", 0) in cluster_strings:
+                    continue
+                m_fret = m.get("fret", 0)
+                all_frets = cluster_frets + ([m_fret] if m_fret > 0 else [])
+                if all_frets and (max(all_frets) - min(all_frets)) > fret_span_max:
+                    continue
+                cluster.append(m)
+                cluster_strings.add(m.get("string", 0))
+                if m_fret > 0:
+                    cluster_frets.append(m_fret)
+                used.add(j)
+            if len(cluster) > 1:
+                used.add(i)
+                for nn in cluster:
+                    assigned_note_indices.add(nn["_idx"])
+                groups.append({
+                    "type": "arpeggio",
+                    "notes": cluster,
+                    "chord": None,
+                    "time": float(cluster[0].get("time", 0)),
+                    "score": 0.0,
+                    "level": 0,
+                })
+            else:
+                used.add(i)
+
+        # 5. Remaining individual notes
+        for n in note_list:
+            if n["_idx"] not in assigned_note_indices:
+                groups.append({
+                    "type": "note",
+                    "notes": [n],
+                    "chord": None,
+                    "time": float(n.get("time", 0)),
+                    "score": 0.0,
+                    "level": 0,
+                })
+
+        groups.sort(key=lambda g: g["time"])
+        return groups
+
+    def _score_groups(groups, tuning):
+        """Compute composite difficulty scores in-place (0–1 per group)."""
+        n_strings = len(tuning)
+
+        def _fret_score(fret):
+            if fret == 0:
+                return 0.0
+            return min(1.0, fret / 22.0)
+
+        def _span_score(notes_list):
+            frets = [n.get("fret", 0) for n in notes_list if n.get("fret", 0) > 0]
+            if len(frets) < 2:
+                return 0.0
+            return min(1.0, (max(frets) - min(frets)) / 6.0)
+
+        def _tech_score(note):
+            tech = note.get("techniques", {}) or {}
+            score = 0.0
+            if tech.get("bend", 0):
+                score += 0.4
+            if tech.get("hammer_on") or tech.get("pull_off"):
+                score += 0.25
+            if tech.get("tap"):
+                score += 0.5
+            if tech.get("slide_to", -1) >= 0 or tech.get("slide_unpitch_to", -1) >= 0:
+                score += 0.2
+            if tech.get("tremolo"):
+                score += 0.3
+            if tech.get("harmonic") or tech.get("harmonic_pinch"):
+                score += 0.15
+            return min(1.0, score)
+
+        total = len(groups)
+        for gi, g in enumerate(groups):
+            notes_list = g["notes"]
+            if not notes_list:
+                g["score"] = 0.0
+                continue
+
+            # Fretting complexity
+            lead_note = notes_list[0]
+            avg_fret = sum(n.get("fret", 0) for n in notes_list) / len(notes_list)
+            fretting = (
+                0.4 * _fret_score(avg_fret)
+                + 0.35 * _span_score(notes_list)
+                + 0.25 * min(1.0, (len(notes_list) - 1) / max(n_strings - 1, 1))
+            )
+
+            # Technique difficulty
+            technique = max(_tech_score(n) for n in notes_list)
+
+            # Note density — compare to nearby groups
+            density_window = 5
+            lo = max(0, gi - density_window)
+            hi = min(total, gi + density_window + 1)
+            nearby_count = sum(len(groups[k]["notes"]) for k in range(lo, hi))
+            density = min(1.0, nearby_count / max(density_window * 4, 1))
+
+            # Sustain ease — long sustained notes are easier
+            max_sus = max(float(n.get("sustain", 0)) for n in notes_list)
+            sustain_ease = min(1.0, max_sus / 2.0)
+
+            g["score"] = (
+                0.35 * fretting
+                + 0.30 * technique
+                + 0.20 * density
+                + 0.15 * (1.0 - sustain_ease)
+            )
+
+    def _assign_levels(groups, n_levels, ramp_up=False):
+        """Assign difficulty levels 0..n_levels-1 to groups using per-phrase percentiles."""
+        if not groups:
+            return
+        scores = [g["score"] for g in groups]
+        scores_sorted = sorted(scores)
+        total = len(scores_sorted)
+        thresholds = [
+            scores_sorted[min(int((i + 1) / n_levels * total), total - 1)]
+            for i in range(n_levels - 1)
+        ]
+        max_lvl = n_levels - 1
+        if ramp_up:
+            max_lvl = min(max_lvl, 2)
+        for g in groups:
+            lvl = 0
+            for t in thresholds:
+                if g["score"] > t:
+                    lvl += 1
+            g["level"] = min(lvl, max_lvl)
+
+    def _notes_for_level(groups, level, tuning):
+        """Return (notes_list, chords_list) for notes at or below the given level."""
+        out_notes = []
+        out_chords = []
+        for g in groups:
+            if g["level"] > level:
+                continue
+            if g["type"] == "chord" and g["chord"] is not None:
+                ch = g["chord"]
+                ch_notes = list(ch.get("notes", []))
+                # For low levels, downgrade chord voicing
+                if level == 0 and len(ch_notes) > 1:
+                    # Keep only root (lowest string = highest index)
+                    ch_notes = [max(ch_notes, key=lambda n: n.get("string", 0))]
+                elif level == 1 and len(ch_notes) > 2:
+                    # Keep root + 5th (power chord — 2 lowest-pitched strings)
+                    ch_notes = sorted(ch_notes, key=lambda n: n.get("string", 0))[-2:]
+                out_chords.append(dict(ch, notes=ch_notes))
+            else:
+                if level == 0 and g["type"] == "arpeggio":
+                    # Only the first note of an arpeggio at lowest difficulty
+                    if g["notes"]:
+                        out_notes.append(g["notes"][0])
+                elif level == 1 and g["type"] == "arpeggio" and len(g["notes"]) > 2:
+                    # First two notes of arpeggio
+                    out_notes.extend(g["notes"][:2])
+                else:
+                    out_notes.extend(g["notes"])
+
+        # Sort by time and remove _idx key before returning
+        def _clean(n):
+            return {k: v for k, v in n.items() if k != "_idx"}
+
+        out_notes = [_clean(n) for n in sorted(out_notes, key=lambda n: float(n.get("time", 0)))]
+        out_chords = sorted(out_chords, key=lambda c: float(c.get("time", 0)))
+        return out_notes, out_chords
+
+    def _generate_anchors(notes, beat_times, *, default_width=4):
+        """Generate anchor list from notes, grouped by beat window."""
+        if not notes:
+            return []
+        anchors = []
+        prev_fret = None
+        prev_width = None
+        for i, bt in enumerate(beat_times):
+            bt_end = beat_times[i + 1] if i + 1 < len(beat_times) else bt + 2.0
+            window_notes = [
+                n for n in notes
+                if bt <= float(n.get("time", 0)) < bt_end and n.get("fret", 0) >= 1
+            ]
+            if not window_notes:
+                continue
+            frets = [n.get("fret", 0) for n in window_notes]
+            min_fret = max(1, min(frets))
+            max_fret = max(frets)
+            width = max(default_width, max_fret - min_fret + 3)
+            if min_fret != prev_fret or width != prev_width:
+                anchors.append({"time": round(bt, 3), "fret": min_fret, "width": width})
+                prev_fret = min_fret
+                prev_width = width
+        return anchors
+
+    def _groups_to_handshapes(groups, chord_templates):
+        """Generate handshape list from note groups."""
+        handshapes = []
+        chord_template_map = {i: ct for i, ct in enumerate(chord_templates)}
+        for g in groups:
+            if g["type"] == "chord" and g["chord"] is not None:
+                ch = g["chord"]
+                t = float(ch.get("time", 0))
+                chord_id = ch.get("chord_id", -1)
+                # Estimate end time from note sustains
+                note_ends = [
+                    t + float(cn.get("sustain", 0))
+                    for cn in ch.get("notes", [])
+                ]
+                t_end = max(note_ends) if note_ends else t + 0.1
+                is_arp = chord_template_map.get(chord_id, {}).get("arpeggio", False)
+                handshapes.append({
+                    "chord_id": chord_id,
+                    "start_time": round(t, 3),
+                    "end_time": round(max(t + 0.05, t_end), 3),
+                    "arpeggio": bool(is_arp),
+                })
+            elif g["type"] == "arpeggio" and len(g["notes"]) > 1:
+                ns = g["notes"]
+                t_start = float(ns[0].get("time", 0))
+                t_end = max(float(n.get("time", 0)) + float(n.get("sustain", 0)) for n in ns)
+                handshapes.append({
+                    "chord_id": -1,
+                    "start_time": round(t_start, 3),
+                    "end_time": round(max(t_start + 0.05, t_end), 3),
+                    "arpeggio": True,
+                })
+        return handshapes
+
+    def _name_chord_templates(chord_templates, notes, chords, tuning, key):
+        """Infer names for chord templates that have empty names."""
+        from lib.chord_analysis import fret_to_midi, name_chord
+        result = []
+        for i, ct in enumerate(chord_templates):
+            if ct.get("name"):
+                result.append(dict(ct))
+                continue
+            frets = ct.get("frets", [])
+            fingers = ct.get("fingers", [])
+            pitch_classes = set()
+            lowest_pc = None
+            lowest_string = len(frets)
+            for si, fr in enumerate(frets):
+                finger = fingers[si] if si < len(fingers) else -1
+                if fr < 0 or finger == -1:
+                    continue
+                midi = fret_to_midi(si, fr, tuning)
+                pc = midi % 12
+                pitch_classes.add(pc)
+                if si > lowest_string or lowest_pc is None:
+                    lowest_string = si
+                    lowest_pc = pc
+            new_ct = dict(ct)
+            if pitch_classes:
+                new_ct["name"] = name_chord(frozenset(pitch_classes), key, lowest_pc)
+            result.append(new_ct)
+        return result
 
     def _song_to_dict(song, audio_url):
         """Convert a Song object to JSON-serializable dict."""

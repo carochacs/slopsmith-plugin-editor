@@ -1223,24 +1223,36 @@ function onMouseDown(e) {
     const idx = hitNote(x, y);
 
     if (idx >= 0) {
-        // Click on note — also select all chord siblings (same time)
+        // Click on note — select the full atomic group (chord, arpeggio, or single note).
+        // _groupNotes() detects chords, link_next chains, handshape windows, and
+        // time-proximity clusters so arpeggios are atomically selectable.
         const nn = notes();
-        const clickedTime = nn[idx].time;
-        const chordSiblings = [];
-        for (let i = 0; i < nn.length; i++) {
-            if (Math.abs(nn[i].time - clickedTime) < 0.001) chordSiblings.push(i);
+        const active = S.arrangements[S.currentArr];
+        const hs = (active && active.handshapes) || [];
+        const groups = _groupNotes(nn, S.chords, hs);
+        // Find the group containing clicked note
+        let groupIndices = [idx];
+        for (const g of groups) {
+            // Match by _idx or by position in nn
+            const memberIndices = g.notes.map(n => {
+                if (n._idx !== undefined) return n._idx;
+                return nn.indexOf(n);
+            }).filter(i => i >= 0);
+            if (memberIndices.includes(idx)) {
+                groupIndices = memberIndices;
+                break;
+            }
         }
-        const isChord = chordSiblings.length > 1;
 
         if (e.shiftKey) {
-            // Multi-select toggle — toggle the whole chord group
-            const allSelected = chordSiblings.every(i => S.sel.has(i));
-            for (const i of chordSiblings) {
+            // Multi-select toggle — toggle the whole group
+            const allSelected = groupIndices.every(i => S.sel.has(i));
+            for (const i of groupIndices) {
                 if (allSelected) S.sel.delete(i); else S.sel.add(i);
             }
         } else if (!S.sel.has(idx)) {
             S.sel.clear();
-            for (const i of chordSiblings) S.sel.add(i);
+            for (const i of groupIndices) S.sel.add(i);
         }
 
         // Start drag
@@ -2112,6 +2124,14 @@ function updateArrangementSelector() {
     const guitarBtn = document.getElementById('editor-add-guitar-btn');
     if (guitarBtn) {
         guitarBtn.classList.toggle('hidden', !S.sessionId || S.format !== 'sloppak');
+    }
+
+    // Show "Difficulties" button for sloppak guitar/bass arrangements (not Keys).
+    const genDiffBtn = document.getElementById('editor-gen-diff-btn');
+    if (genDiffBtn) {
+        const activeArr = S.arrangements[S.currentArr];
+        const isGuitar = activeArr && !/keys|piano|drums/i.test(activeArr.name || '');
+        genDiffBtn.classList.toggle('hidden', !S.sessionId || S.format !== 'sloppak' || !isGuitar);
     }
 
     // Show "⋮ Strings" tuning editor whenever a guitar/bass arrangement is
@@ -4296,6 +4316,178 @@ window.editorAddEmptyGuitar = async () => {
         statusEl.textContent = 'Failed: ' + e.message;
     } finally {
         _addingEmptyGuitar = false;
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════
+// Note grouping (JS mirror of backend _group_notes_impl)
+// ════════════════════════════════════════════════════════════════════
+
+function _groupNotes(notes, chords, handshapes, { timeWindowMs = 150, fretSpanMax = 4 } = {}) {
+    const groups = [];
+    const assignedNoteIndices = new Set();
+
+    // 1. Explicit chords
+    for (const ch of chords) {
+        groups.push({ type: 'chord', notes: Array.from(ch.notes || []), chord: ch, time: ch.time || 0, score: 0, level: 0 });
+    }
+
+    // 2. link_next chains
+    const noteList = notes.map((n, i) => ({ ...n, _idx: i }));
+    const inChain = new Set();
+    for (let i = 0; i < noteList.length; i++) {
+        if (inChain.has(i)) continue;
+        const n = noteList[i];
+        if (!(n.techniques && n.techniques.link_next)) continue;
+        const chain = [n];
+        inChain.add(i);
+        let cur = n;
+        while (true) {
+            const curEnd = (cur.time || 0) + (cur.sustain || 0);
+            const curStr = cur.string || 0;
+            let nextEntry = null;
+            for (let j = 0; j < noteList.length; j++) {
+                if (inChain.has(j)) continue;
+                const m = noteList[j];
+                if ((m.string || 0) === curStr && Math.abs((m.time || 0) - curEnd) < 0.05) {
+                    nextEntry = [j, m];
+                    break;
+                }
+            }
+            if (!nextEntry) break;
+            const [jj, mm] = nextEntry;
+            chain.push(mm);
+            inChain.add(jj);
+            cur = mm;
+            if (!(mm.techniques && mm.techniques.link_next)) break;
+        }
+        if (chain.length > 1) {
+            for (const nn of chain) assignedNoteIndices.add(nn._idx);
+            groups.push({ type: 'arpeggio', notes: chain, chord: null, time: chain[0].time || 0, score: 0, level: 0 });
+        }
+    }
+
+    // 3. Handshape windows
+    if (handshapes && handshapes.length) {
+        const sortedHs = [...handshapes].sort((a, b) => (a.start_time || 0) - (b.start_time || 0));
+        for (const hs of sortedHs) {
+            const tStart = hs.start_time || 0;
+            const tEnd = hs.end_time || tStart + 0.5;
+            const windowNotes = noteList.filter(n => !assignedNoteIndices.has(n._idx) && (n.time || 0) >= tStart && (n.time || 0) < tEnd);
+            if (windowNotes.length > 1) {
+                for (const nn of windowNotes) assignedNoteIndices.add(nn._idx);
+                groups.push({ type: 'arpeggio', notes: windowNotes, chord: null, time: tStart, score: 0, level: 0 });
+            }
+        }
+    }
+
+    // 4. Time-proximity clusters
+    const remaining = noteList.filter(n => !assignedNoteIndices.has(n._idx)).sort((a, b) => (a.time || 0) - (b.time || 0));
+    const used = new Set();
+    for (let i = 0; i < remaining.length; i++) {
+        if (used.has(i)) continue;
+        const n = remaining[i];
+        const cluster = [n];
+        const clusterStrings = new Set([n.string || 0]);
+        const clusterFrets = n.fret > 0 ? [n.fret] : [];
+        for (let j = i + 1; j < remaining.length; j++) {
+            if (used.has(j)) continue;
+            const m = remaining[j];
+            const dtMs = ((m.time || 0) - (n.time || 0)) * 1000;
+            if (dtMs > timeWindowMs) break;
+            if (clusterStrings.has(m.string || 0)) continue;
+            const allFrets = [...clusterFrets, ...(m.fret > 0 ? [m.fret] : [])];
+            if (allFrets.length && (Math.max(...allFrets) - Math.min(...allFrets)) > fretSpanMax) continue;
+            cluster.push(m);
+            clusterStrings.add(m.string || 0);
+            if (m.fret > 0) clusterFrets.push(m.fret);
+            used.add(j);
+        }
+        used.add(i);
+        if (cluster.length > 1) {
+            for (const nn of cluster) assignedNoteIndices.add(nn._idx);
+            groups.push({ type: 'arpeggio', notes: cluster, chord: null, time: cluster[0].time || 0, score: 0, level: 0 });
+        }
+    }
+
+    // 5. Remaining individual notes
+    for (const n of noteList) {
+        if (!assignedNoteIndices.has(n._idx)) {
+            groups.push({ type: 'note', notes: [n], chord: null, time: n.time || 0, score: 0, level: 0 });
+        }
+    }
+
+    groups.sort((a, b) => a.time - b.time);
+    return groups;
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Generate difficulty levels for current arrangement
+// ════════════════════════════════════════════════════════════════════
+
+window.editorGenerateDifficulties = async () => {
+    if (S.format !== 'sloppak' || !S.sessionId) return;
+    const genBtn = document.getElementById('editor-gen-diff-btn');
+    const keyBadge = document.getElementById('editor-key-badge');
+    if (genBtn) {
+        genBtn.disabled = true;
+        genBtn.textContent = 'Generating...';
+    }
+    setStatus('Generating difficulty levels...');
+    try {
+        const active = S.arrangements[S.currentArr];
+        const resp = await fetch('/api/plugins/editor/generate-difficulties', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                session_id: S.sessionId,
+                arrangement_index: S.currentArr,
+                arrangement: {
+                    name: active.name,
+                    tuning: active.tuning,
+                    capo: active.capo || 0,
+                    notes: S.notes,
+                    chords: S.chords,
+                    chord_templates: S.chordTemplates,
+                    handshapes: active.handshapes || [],
+                    beats: S.beats,
+                    sections: S.sections,
+                },
+                beats: S.beats,
+                sections: S.sections,
+            }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data.error) {
+            setStatus('Generate failed: ' + (data.error || resp.status));
+            return;
+        }
+        // Merge results into current arrangement
+        if (!S.arrangements[S.currentArr]) return;
+        S.arrangements[S.currentArr].phrases = data.phrases || [];
+        S.arrangements[S.currentArr].handshapes = data.handshapes || [];
+        // Update chord templates (names inferred)
+        if (data.chord_templates && data.chord_templates.length) {
+            S.chordTemplates = data.chord_templates;
+            S.arrangements[S.currentArr].chord_templates = data.chord_templates;
+        }
+        markDirty();
+        draw();
+        const keyStr = data.key || '';
+        if (keyBadge) {
+            keyBadge.textContent = keyStr ? `Key: ${keyStr}` : '';
+            keyBadge.classList.toggle('hidden', !keyStr);
+        }
+        const phraseCount = (data.phrases || []).length;
+        const levelCount = phraseCount > 0 ? ((data.phrases[0].levels || []).length) : 0;
+        setStatus(`Key: ${keyStr || '?'} — ${phraseCount} phrase${phraseCount !== 1 ? 's' : ''}, ${levelCount} difficulty levels generated. Save to commit.`);
+    } catch (e) {
+        setStatus('Generate failed: ' + e.message);
+    } finally {
+        if (genBtn) {
+            genBtn.disabled = false;
+            genBtn.textContent = '⟳ Difficulties';
+        }
     }
 };
 
