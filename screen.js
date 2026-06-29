@@ -4471,7 +4471,6 @@ window.editorGenerateDifficulties = async () => {
             S.chordTemplates = data.chord_templates;
             S.arrangements[S.currentArr].chord_templates = data.chord_templates;
         }
-        markDirty();
         draw();
         const keyStr = data.key || '';
         if (keyBadge) {
