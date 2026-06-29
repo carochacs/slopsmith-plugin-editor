@@ -2549,7 +2549,7 @@ def setup(app, context):
                         "notes": lvl_notes,
                         "chords": lvl_chords,
                         "anchors": lvl_anchors,
-                        "hand_shapes": lvl_handshapes,
+                        "handshapes": lvl_handshapes,
                     })
                 phrases_out.append({
                     "start_time": round(t_start, 3),
@@ -3214,30 +3214,37 @@ def setup(app, context):
             g["level"] = min(lvl, max_lvl)
 
     def _notes_for_level(groups, level, tuning):
-        """Return (notes_list, chords_list) for notes at or below the given level."""
+        """Return (notes_list, chords_list) for notes at or below the given level.
+
+        Chord groups are flattened to individual notes so phrase levels have no
+        chord_id references. This avoids stale chord_id / chord-template index
+        mismatches when reconstructChords() reindexes templates before save.
+        """
         out_notes = []
-        out_chords = []
         for g in groups:
             if g["level"] > level:
                 continue
             if g["type"] == "chord" and g["chord"] is not None:
                 ch = g["chord"]
+                ch_time = float(ch.get("time", 0))
                 ch_notes = list(ch.get("notes", []))
-                # For low levels, downgrade chord voicing
+                # For low levels, reduce chord voicing
                 if level == 0 and len(ch_notes) > 1:
-                    # Keep only root (lowest string = highest index)
+                    # Keep only root (lowest pitch = highest string index)
                     ch_notes = [max(ch_notes, key=lambda n: n.get("string", 0))]
                 elif level == 1 and len(ch_notes) > 2:
-                    # Keep root + 5th (power chord — 2 lowest-pitched strings)
+                    # Keep root + 5th (2 lowest-pitched strings)
                     ch_notes = sorted(ch_notes, key=lambda n: n.get("string", 0))[-2:]
-                out_chords.append(dict(ch, notes=ch_notes))
+                # Flatten chord notes into individual notes using the chord's time
+                for cn in ch_notes:
+                    merged = dict(cn)
+                    merged["time"] = ch_time  # ensure time is set (chord notes may omit it)
+                    out_notes.append(merged)
             else:
                 if level == 0 and g["type"] == "arpeggio":
-                    # Only the first note of an arpeggio at lowest difficulty
                     if g["notes"]:
                         out_notes.append(g["notes"][0])
                 elif level == 1 and g["type"] == "arpeggio" and len(g["notes"]) > 2:
-                    # First two notes of arpeggio
                     out_notes.extend(g["notes"][:2])
                 else:
                     out_notes.extend(g["notes"])
@@ -3265,21 +3272,8 @@ def setup(app, context):
                 "tp": bool(tech.get("tap", False)),
             }
 
-        def _chord_note_wire(n):
-            d = _to_wire(n)
-            d.pop("t", None)
-            return d
-
-        out_notes = [_to_wire(n) for n in sorted(out_notes, key=lambda n: float(n.get("time", 0)))]
-        out_chords_wire = []
-        for ch in sorted(out_chords, key=lambda c: float(c.get("time", 0))):
-            out_chords_wire.append({
-                "t": round(float(ch.get("time", 0)), 3),
-                "id": int(ch.get("chord_id", -1)),
-                "hd": bool(ch.get("high_density", False)),
-                "notes": [_chord_note_wire(cn) for cn in ch.get("notes", [])],
-            })
-        return out_notes, out_chords_wire
+        out_notes_wire = [_to_wire(n) for n in sorted(out_notes, key=lambda n: float(n.get("time", 0)))]
+        return out_notes_wire, []
 
     def _generate_anchors(notes, beat_times, *, default_width=4):
         """Generate anchor list from notes, grouped by beat window."""
@@ -3326,7 +3320,7 @@ def setup(app, context):
                     "chord_id": chord_id,
                     "start_time": round(t, 3),
                     "end_time": round(max(t + 0.05, t_end), 3),
-                    "arpeggio": bool(is_arp),
+                    "arp": bool(is_arp),
                 })
             elif g["type"] == "arpeggio" and len(g["notes"]) > 1:
                 ns = g["notes"]
@@ -3336,7 +3330,7 @@ def setup(app, context):
                     "chord_id": -1,
                     "start_time": round(t_start, 3),
                     "end_time": round(max(t_start + 0.05, t_end), 3),
-                    "arpeggio": True,
+                    "arp": True,
                 })
         return handshapes
 
