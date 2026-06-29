@@ -2549,7 +2549,7 @@ def setup(app, context):
                         "notes": lvl_notes,
                         "chords": lvl_chords,
                         "anchors": lvl_anchors,
-                        "hand_shapes": lvl_handshapes,
+                        "handshapes": lvl_handshapes,
                     })
                 phrases_out.append({
                     "start_time": round(t_start, 3),
@@ -3214,41 +3214,66 @@ def setup(app, context):
             g["level"] = min(lvl, max_lvl)
 
     def _notes_for_level(groups, level, tuning):
-        """Return (notes_list, chords_list) for notes at or below the given level."""
+        """Return (notes_list, chords_list) for notes at or below the given level.
+
+        Chord groups are flattened to individual notes so phrase levels have no
+        chord_id references. This avoids stale chord_id / chord-template index
+        mismatches when reconstructChords() reindexes templates before save.
+        """
         out_notes = []
-        out_chords = []
         for g in groups:
             if g["level"] > level:
                 continue
             if g["type"] == "chord" and g["chord"] is not None:
                 ch = g["chord"]
+                ch_time = float(ch.get("time", 0))
                 ch_notes = list(ch.get("notes", []))
-                # For low levels, downgrade chord voicing
+                # For low levels, reduce chord voicing
                 if level == 0 and len(ch_notes) > 1:
-                    # Keep only root (lowest string = highest index)
+                    # Keep only root (lowest pitch = highest string index)
                     ch_notes = [max(ch_notes, key=lambda n: n.get("string", 0))]
                 elif level == 1 and len(ch_notes) > 2:
-                    # Keep root + 5th (power chord — 2 lowest-pitched strings)
+                    # Keep root + 5th (2 lowest-pitched strings)
                     ch_notes = sorted(ch_notes, key=lambda n: n.get("string", 0))[-2:]
-                out_chords.append(dict(ch, notes=ch_notes))
+                # Flatten chord notes into individual notes using the chord's time
+                for cn in ch_notes:
+                    merged = dict(cn)
+                    merged["time"] = ch_time  # ensure time is set (chord notes may omit it)
+                    out_notes.append(merged)
             else:
                 if level == 0 and g["type"] == "arpeggio":
-                    # Only the first note of an arpeggio at lowest difficulty
                     if g["notes"]:
                         out_notes.append(g["notes"][0])
                 elif level == 1 and g["type"] == "arpeggio" and len(g["notes"]) > 2:
-                    # First two notes of arpeggio
                     out_notes.extend(g["notes"][:2])
                 else:
                     out_notes.extend(g["notes"])
 
-        # Sort by time and remove _idx key before returning
-        def _clean(n):
-            return {k: v for k, v in n.items() if k != "_idx"}
+        # Convert editor long-format → sloppak wire format so phrase notes
+        # match what the server streams (t/s/f/sus/... not time/string/fret/...).
+        def _to_wire(n):
+            tech = n.get("techniques", {}) or {}
+            return {
+                "t": round(float(n.get("time", 0)), 3),
+                "s": int(n.get("string", 0)),
+                "f": int(n.get("fret", 0)),
+                "sus": round(float(n.get("sustain", 0)), 3),
+                "sl": int(tech.get("slide_to", -1)),
+                "slu": int(tech.get("slide_unpitch_to", -1)),
+                "bn": round(float(tech.get("bend", 0) or 0), 1),
+                "ho": bool(tech.get("hammer_on", False)),
+                "po": bool(tech.get("pull_off", False)),
+                "hm": bool(tech.get("harmonic", False)),
+                "hp": bool(tech.get("harmonic_pinch", False)),
+                "pm": bool(tech.get("palm_mute", False)),
+                "mt": bool(tech.get("mute", False)),
+                "tr": bool(tech.get("tremolo", False)),
+                "ac": bool(tech.get("accent", False)),
+                "tp": bool(tech.get("tap", False)),
+            }
 
-        out_notes = [_clean(n) for n in sorted(out_notes, key=lambda n: float(n.get("time", 0)))]
-        out_chords = sorted(out_chords, key=lambda c: float(c.get("time", 0)))
-        return out_notes, out_chords
+        out_notes_wire = [_to_wire(n) for n in sorted(out_notes, key=lambda n: float(n.get("time", 0)))]
+        return out_notes_wire, []
 
     def _generate_anchors(notes, beat_times, *, default_width=4):
         """Generate anchor list from notes, grouped by beat window."""
@@ -3261,11 +3286,11 @@ def setup(app, context):
             bt_end = beat_times[i + 1] if i + 1 < len(beat_times) else bt + 2.0
             window_notes = [
                 n for n in notes
-                if bt <= float(n.get("time", 0)) < bt_end and n.get("fret", 0) >= 1
+                if bt <= float(n.get("t", n.get("time", 0))) < bt_end and n.get("f", n.get("fret", 0)) >= 1
             ]
             if not window_notes:
                 continue
-            frets = [n.get("fret", 0) for n in window_notes]
+            frets = [n.get("f", n.get("fret", 0)) for n in window_notes]
             min_fret = max(1, min(frets))
             max_fret = max(frets)
             width = max(default_width, max_fret - min_fret + 3)
@@ -3295,7 +3320,7 @@ def setup(app, context):
                     "chord_id": chord_id,
                     "start_time": round(t, 3),
                     "end_time": round(max(t + 0.05, t_end), 3),
-                    "arpeggio": bool(is_arp),
+                    "arp": bool(is_arp),
                 })
             elif g["type"] == "arpeggio" and len(g["notes"]) > 1:
                 ns = g["notes"]
@@ -3305,7 +3330,7 @@ def setup(app, context):
                     "chord_id": -1,
                     "start_time": round(t_start, 3),
                     "end_time": round(max(t_start + 0.05, t_end), 3),
-                    "arpeggio": True,
+                    "arp": True,
                 })
         return handshapes
 
