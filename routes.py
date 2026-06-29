@@ -3242,13 +3242,44 @@ def setup(app, context):
                 else:
                     out_notes.extend(g["notes"])
 
-        # Sort by time and remove _idx key before returning
-        def _clean(n):
-            return {k: v for k, v in n.items() if k != "_idx"}
+        # Convert editor long-format → sloppak wire format so phrase notes
+        # match what the server streams (t/s/f/sus/... not time/string/fret/...).
+        def _to_wire(n):
+            tech = n.get("techniques", {}) or {}
+            return {
+                "t": round(float(n.get("time", 0)), 3),
+                "s": int(n.get("string", 0)),
+                "f": int(n.get("fret", 0)),
+                "sus": round(float(n.get("sustain", 0)), 3),
+                "sl": int(tech.get("slide_to", -1)),
+                "slu": int(tech.get("slide_unpitch_to", -1)),
+                "bn": round(float(tech.get("bend", 0) or 0), 1),
+                "ho": bool(tech.get("hammer_on", False)),
+                "po": bool(tech.get("pull_off", False)),
+                "hm": bool(tech.get("harmonic", False)),
+                "hp": bool(tech.get("harmonic_pinch", False)),
+                "pm": bool(tech.get("palm_mute", False)),
+                "mt": bool(tech.get("mute", False)),
+                "tr": bool(tech.get("tremolo", False)),
+                "ac": bool(tech.get("accent", False)),
+                "tp": bool(tech.get("tap", False)),
+            }
 
-        out_notes = [_clean(n) for n in sorted(out_notes, key=lambda n: float(n.get("time", 0)))]
-        out_chords = sorted(out_chords, key=lambda c: float(c.get("time", 0)))
-        return out_notes, out_chords
+        def _chord_note_wire(n):
+            d = _to_wire(n)
+            d.pop("t", None)
+            return d
+
+        out_notes = [_to_wire(n) for n in sorted(out_notes, key=lambda n: float(n.get("time", 0)))]
+        out_chords_wire = []
+        for ch in sorted(out_chords, key=lambda c: float(c.get("time", 0))):
+            out_chords_wire.append({
+                "t": round(float(ch.get("time", 0)), 3),
+                "id": int(ch.get("chord_id", -1)),
+                "hd": bool(ch.get("high_density", False)),
+                "notes": [_chord_note_wire(cn) for cn in ch.get("notes", [])],
+            })
+        return out_notes, out_chords_wire
 
     def _generate_anchors(notes, beat_times, *, default_width=4):
         """Generate anchor list from notes, grouped by beat window."""
@@ -3261,11 +3292,11 @@ def setup(app, context):
             bt_end = beat_times[i + 1] if i + 1 < len(beat_times) else bt + 2.0
             window_notes = [
                 n for n in notes
-                if bt <= float(n.get("time", 0)) < bt_end and n.get("fret", 0) >= 1
+                if bt <= float(n.get("t", n.get("time", 0))) < bt_end and n.get("f", n.get("fret", 0)) >= 1
             ]
             if not window_notes:
                 continue
-            frets = [n.get("fret", 0) for n in window_notes]
+            frets = [n.get("f", n.get("fret", 0)) for n in window_notes]
             min_fret = max(1, min(frets))
             max_fret = max(frets)
             width = max(default_width, max_fret - min_fret + 3)
