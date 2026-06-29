@@ -1229,7 +1229,7 @@ function onMouseDown(e) {
         const nn = notes();
         const active = S.arrangements[S.currentArr];
         const hs = (active && active.handshapes) || [];
-        const groups = _groupNotes(nn, S.chords, hs);
+        const groups = _groupNotes(nn, chords(), hs);
         // Find the group containing clicked note
         let groupIndices = [idx];
         for (const g of groups) {
@@ -4446,9 +4446,9 @@ window.editorGenerateDifficulties = async () => {
                     name: active.name,
                     tuning: active.tuning,
                     capo: active.capo || 0,
-                    notes: S.notes,
-                    chords: S.chords,
-                    chord_templates: S.chordTemplates,
+                    notes: notes(),
+                    chords: chords(),
+                    chord_templates: S.arrangements[S.currentArr].chord_templates || [],
                     handshapes: active.handshapes || [],
                     beats: S.beats,
                     sections: S.sections,
