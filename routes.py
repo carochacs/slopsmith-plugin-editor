@@ -46,6 +46,8 @@ def setup(app, context):
     from lib.audio import find_wem_files, convert_wem
     from lib import sloppak as sloppak_mod
 
+    _chord_analysis = context["load_sibling"]("chord_analysis")
+
     # The editor needs to write extracted audio / art into a directory it
     # can also serve from. On the web Docker image `slopsmith/static/` is
     # writable, so historically the plugin reused that path and surfaced
@@ -830,7 +832,7 @@ def setup(app, context):
                 # Auto-name unnamed chord templates on save
                 if any(not ct.get("name") for ct in arr_cts):
                     try:
-                        from lib.chord_analysis import detect_key
+                        detect_key = _chord_analysis.detect_key
                         all_ns = list(arr_notes)
                         for ch in arr_chords:
                             for cn in ch.get("notes", []):
@@ -2473,9 +2475,10 @@ def setup(app, context):
         sections = arr_data.get("sections", []) or data.get("sections", [])
 
         def _run():
-            from lib.chord_analysis import (
-                detect_key, name_chord, key_name, fret_to_midi,
-            )
+            detect_key = _chord_analysis.detect_key
+            name_chord = _chord_analysis.name_chord
+            key_name = _chord_analysis.key_name
+            fret_to_midi = _chord_analysis.fret_to_midi
 
             # ── Key detection ─────────────────────────────────────────
             all_notes = list(notes)
@@ -3308,7 +3311,8 @@ def setup(app, context):
 
     def _name_chord_templates(chord_templates, notes, chords, tuning, key):
         """Infer names for chord templates that have empty names."""
-        from lib.chord_analysis import fret_to_midi, name_chord
+        fret_to_midi = _chord_analysis.fret_to_midi
+        name_chord = _chord_analysis.name_chord
         result = []
         for i, ct in enumerate(chord_templates):
             if ct.get("name"):
