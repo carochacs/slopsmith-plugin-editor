@@ -2580,6 +2580,223 @@ def setup(app, context):
 
         return result
 
+    # ── Library: check if a sloppak already has phrase data ──────────
+
+    @app.get("/api/plugins/editor/sloppak-has-phrases")
+    async def sloppak_has_phrases(filename: str = ""):
+        """Return {has_phrases: bool} — fast check without loading the full song."""
+        if not filename.lower().endswith(".sloppak"):
+            return JSONResponse({"error": "Not a sloppak"}, 400)
+        dlc_dir = get_dlc_dir()
+        filepath = (dlc_dir / filename).resolve()
+        dlc_resolved = dlc_dir.resolve()
+        if not filepath.exists() or not str(filepath).startswith(str(dlc_resolved)):
+            return JSONResponse({"error": "File not found"}, 400)
+
+        SKIP_NAMES = {"drum", "key", "piano"}
+
+        def _check():
+            source_dir = Path(sloppak_mod.resolve_source_dir(filename, dlc_dir, SLOPPAK_CACHE))
+            arr_dir = source_dir / "arrangements"
+            if not arr_dir.exists():
+                return True
+            for arr_path in sorted(arr_dir.glob("*.json")):
+                if any(s in arr_path.stem.lower() for s in SKIP_NAMES):
+                    continue
+                try:
+                    arr_json = json.loads(arr_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not arr_json.get("phrases"):
+                    return False
+            return True
+
+        try:
+            has = await asyncio.get_event_loop().run_in_executor(None, _check)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, 500)
+        return {"has_phrases": has}
+
+    # ── Library: batch-generate difficulties for a sloppak from disk ──
+
+    @app.post("/api/plugins/editor/fix-difficulties")
+    async def fix_difficulties(data: dict):
+        """Generate phrase difficulty ladders for all guitar/bass arrangements in a
+        sloppak file, writing the result back to disk without opening an editor session.
+        """
+        filename = data.get("filename", "")
+        if not filename.lower().endswith(".sloppak"):
+            return JSONResponse({"error": "Not a sloppak"}, 400)
+        dlc_dir = get_dlc_dir()
+        filepath = (dlc_dir / filename).resolve()
+        dlc_resolved = dlc_dir.resolve()
+        if not filepath.exists() or not str(filepath).startswith(str(dlc_resolved)):
+            return JSONResponse({"error": "File not found"}, 400)
+
+        n_levels = data.get("n_levels", 5)
+        try:
+            n_levels = max(2, min(int(n_levels), 10))
+        except (TypeError, ValueError):
+            n_levels = 5
+
+        SKIP_NAMES = {"drum", "key", "piano"}
+
+        def _run():
+            source_dir = Path(sloppak_mod.resolve_source_dir(filename, dlc_dir, SLOPPAK_CACHE))
+            arr_dir = source_dir / "arrangements"
+            if not arr_dir.exists():
+                return {"updated": 0, "skipped": 0, "key": ""}
+
+            updated = 0
+            skipped = 0
+            last_key = ""
+
+            def _wire_note_to_editor(wn, time_override=None):
+                t = float(time_override if time_override is not None else wn.get("t", 0))
+                return {
+                    "time": t,
+                    "string": int(wn.get("s", 0)),
+                    "fret": int(wn.get("f", 0)),
+                    "sustain": float(wn.get("sus", 0)),
+                    "techniques": {
+                        "slide_to": int(wn.get("sl", -1)),
+                        "slide_unpitch_to": int(wn.get("slu", -1)),
+                        "bend": float(wn.get("bn", 0) or 0),
+                        "hammer_on": bool(wn.get("ho", False)),
+                        "pull_off": bool(wn.get("po", False)),
+                        "harmonic": bool(wn.get("hm", False)),
+                        "harmonic_pinch": bool(wn.get("hp", False)),
+                        "palm_mute": bool(wn.get("pm", False)),
+                        "mute": bool(wn.get("mt", False)),
+                        "tremolo": bool(wn.get("tr", False)),
+                        "accent": bool(wn.get("ac", False)),
+                        "tap": bool(wn.get("tp", False)),
+                    },
+                }
+
+            def _wire_chord_to_editor(wc):
+                t = float(wc.get("t", 0))
+                return {
+                    "time": t,
+                    "chord_id": int(wc.get("id", -1)),
+                    "high_density": bool(wc.get("hd", False)),
+                    "notes": [_wire_note_to_editor(cn, time_override=t) for cn in wc.get("notes", [])],
+                }
+
+            for arr_path in sorted(arr_dir.glob("*.json")):
+                if any(s in arr_path.stem.lower() for s in SKIP_NAMES):
+                    skipped += 1
+                    continue
+
+                try:
+                    arr_json = json.loads(arr_path.read_text(encoding="utf-8"))
+                except Exception:
+                    skipped += 1
+                    continue
+
+                if arr_json.get("phrases"):
+                    skipped += 1
+                    continue
+
+                tuning = arr_json.get("tuning", [0] * 6)
+                notes = [_wire_note_to_editor(wn) for wn in arr_json.get("notes", [])]
+                chords = [_wire_chord_to_editor(wc) for wc in arr_json.get("chords", [])]
+                wire_handshapes = arr_json.get("handshapes", [])
+                # chord templates: convert "arp" → "arpeggio" for _groups_to_handshapes lookup
+                chord_templates = [
+                    {**ct, "arpeggio": bool(ct.get("arp", False))}
+                    for ct in arr_json.get("templates", [])
+                ]
+
+                # Key detection
+                all_notes_kd = list(notes)
+                for ch in chords:
+                    for cn in ch.get("notes", []):
+                        all_notes_kd.append({
+                            "string": cn.get("string", 0),
+                            "fret": cn.get("fret", 0),
+                            "sustain": cn.get("sustain", 0),
+                        })
+                key = _chord_analysis.detect_key(all_notes_kd, tuning)
+                last_key = _chord_analysis.key_name(key)
+
+                groups = _group_notes_impl(notes, chords, wire_handshapes)
+                _score_groups(groups, tuning)
+
+                # Phrase windows: 30s slices (no beat/section data on disk)
+                duration = max(
+                    (float(n["time"]) + float(n["sustain"]) for n in notes),
+                    default=0.0,
+                )
+                for ch in chords:
+                    duration = max(duration, float(ch["time"]) + 0.1)
+                if duration == 0.0:
+                    duration = 30.0
+
+                phrase_windows = []
+                t = 0.0
+                while t < duration:
+                    phrase_windows.append((t, min(t + 30.0, duration)))
+                    t += 30.0
+                if not phrase_windows:
+                    phrase_windows = [(0.0, duration)]
+
+                phrases_out = []
+                for phrase_idx, (t_start, t_end) in enumerate(phrase_windows):
+                    phrase_groups = [g for g in groups if t_start <= g["time"] < t_end]
+                    if not phrase_groups:
+                        continue
+                    _assign_levels(phrase_groups, n_levels, ramp_up=(phrase_idx == 0))
+                    levels_out = []
+                    for lvl in range(n_levels):
+                        lvl_notes, lvl_chords = _notes_for_level(phrase_groups, lvl, tuning)
+                        lvl_anchors = _generate_anchors(lvl_notes, [])
+                        lvl_handshapes = _groups_to_handshapes(
+                            [g for g in phrase_groups if g["level"] <= lvl],
+                            chord_templates,
+                        )
+                        levels_out.append({
+                            "difficulty": lvl,
+                            "notes": lvl_notes,
+                            "chords": lvl_chords,
+                            "anchors": lvl_anchors,
+                            "handshapes": lvl_handshapes,
+                        })
+                    phrases_out.append({
+                        "start_time": round(t_start, 3),
+                        "end_time": round(t_end, 3),
+                        "max_difficulty": n_levels - 1,
+                        "levels": levels_out,
+                    })
+
+                if not phrases_out:
+                    skipped += 1
+                    continue
+
+                arr_json["phrases"] = phrases_out
+                arr_path.write_text(json.dumps(arr_json, ensure_ascii=False), encoding="utf-8")
+                updated += 1
+
+            # Re-zip if the sloppak is file-form (zip archive)
+            if filepath.is_file() and updated > 0:
+                tmp_zip = filepath.with_suffix(filepath.suffix + ".tmp")
+                with zipfile.ZipFile(str(tmp_zip), "w", zipfile.ZIP_DEFLATED) as zf:
+                    for f in source_dir.rglob("*"):
+                        if f.is_file():
+                            zf.write(f, f.relative_to(source_dir).as_posix())
+                tmp_zip.replace(filepath)
+
+            return {"updated": updated, "skipped": skipped, "key": last_key}
+
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(None, _run)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, 500)
+
+        return result
+
     # ── Build CDLC from create-mode session ──────────────────────────
 
     @app.post("/api/plugins/editor/build")

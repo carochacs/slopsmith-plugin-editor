@@ -5415,4 +5415,89 @@ if (document.getElementById('editor-canvas')) {
     }, 100);
 }
 
+// ── Library card: "Add Difficulties" button ──────────────────────────────────
+
+async function _maybeInjectFixDiffBtn(card) {
+    if (!card || card.querySelector('.editor-fix-diff-btn')) return;
+    const play = card.dataset && card.dataset.play;
+    if (!play) return;
+    const filename = decodeURIComponent(play);
+    if (!filename.toLowerCase().endsWith('.sloppak')) return;
+    const inner = card.querySelector('.p-4');
+    if (!inner) return;
+    try {
+        const r = await fetch('/api/plugins/editor/sloppak-has-phrases?filename=' + play);
+        if (!r.ok) return;
+        const d = await r.json();
+        if (d.has_phrases) return;
+    } catch { return; }
+    // Guard: card may have been removed or another call already injected the button
+    if (!card.isConnected || card.querySelector('.editor-fix-diff-btn')) return;
+    const btn = document.createElement('button');
+    btn.className = 'editor-fix-diff-btn mt-2 w-full px-2 py-1.5 bg-blue-900/40 hover:bg-blue-900/60 border border-blue-800 rounded-lg text-xs font-medium text-blue-300 transition-colors';
+    btn.dataset.filenameEncoded = play;
+    btn.textContent = '⟳ Add Difficulties';
+    inner.appendChild(btn);
+}
+
+const _fixDiffObserver = new MutationObserver(mutations => {
+    for (const m of mutations) {
+        for (const node of m.addedNodes) {
+            if (node.nodeType !== 1) continue;
+            if (node.classList && node.classList.contains('song-card')) {
+                _maybeInjectFixDiffBtn(node);
+            } else if (node.querySelectorAll) {
+                node.querySelectorAll('.song-card[data-play]').forEach(_maybeInjectFixDiffBtn);
+            }
+        }
+    }
+});
+
+function _startFixDiffObserver() {
+    for (const id of ['lib-grid', 'fav-grid']) {
+        const el = document.getElementById(id);
+        if (el && !el._editorFixDiffObserved) {
+            _fixDiffObserver.observe(el, { childList: true });
+            el._editorFixDiffObserved = true;
+        }
+    }
+    document.querySelectorAll('#lib-grid .song-card[data-play], #fav-grid .song-card[data-play]').forEach(_maybeInjectFixDiffBtn);
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _startFixDiffObserver);
+} else {
+    _startFixDiffObserver();
+}
+
+document.addEventListener('click', async function _onFixDiffClick(e) {
+    const btn = e.target.closest('.editor-fix-diff-btn');
+    if (!btn) return;
+    e.stopPropagation();
+    const filename = decodeURIComponent(btn.dataset.filenameEncoded || '');
+    if (!filename) return;
+    btn.disabled = true;
+    btn.textContent = '⌛ Generating…';
+    try {
+        const resp = await fetch('/api/plugins/editor/fix-difficulties', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename }),
+        });
+        const data = await resp.json();
+        if (data.error) {
+            btn.textContent = '✗ ' + data.error;
+            btn.disabled = false;
+        } else {
+            btn.textContent = '✓ Done';
+            btn.classList.remove('text-blue-300', 'bg-blue-900/40', 'hover:bg-blue-900/60', 'border-blue-800');
+            btn.classList.add('text-green-400');
+            setTimeout(() => { if (btn.isConnected) btn.remove(); }, 1500);
+        }
+    } catch (err) {
+        btn.textContent = '✗ ' + err.message;
+        btn.disabled = false;
+    }
+});
+
 })();
