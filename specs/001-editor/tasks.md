@@ -65,7 +65,7 @@ Status legend: **DONE** = shipped in v1.0.2; **OPEN** = candidate work. `[P]` = 
 - **DONE** IIFE scoping; minimal window leakage
 - **DONE** [P] Session TTL / cleanup — startup task evicts sessions untouched > 1 h; deletes temp dirs for psarc/create sessions
 - **DONE** [P] Two-tab edit conflict detection — `_version` counter on each session; save returns 409 on mismatch, frontend shows conflict message
-- **OPEN** Test harness for the import pipelines (no fixtures today)
+- **DONE** [P] Test harness for `chord_analysis.py` — `tests/test_chord_analysis.py`, 31 cases covering `fret_to_midi` (7), Pearson correlation (3), note naming (3), key name (4), chord naming (10), and `detect_key` (4). Run with `python -m pytest tests/test_chord_analysis.py`. Import pipeline tests omitted — all routes require binary GP/MIDI fixtures.
 - **DONE** README — install steps, format table, feature overview
 
 ## Documentation
