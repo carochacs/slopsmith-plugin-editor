@@ -66,10 +66,10 @@ Status legend: **DONE** = shipped in v1.0.2; **OPEN** = candidate work. `[P]` = 
 - **DONE** [P] Session TTL / cleanup — startup task evicts sessions untouched > 1 h; deletes temp dirs for psarc/create sessions
 - **DONE** [P] Two-tab edit conflict detection — `_version` counter on each session; save returns 409 on mismatch, frontend shows conflict message
 - **OPEN** Test harness for the import pipelines (no fixtures today)
-- **OPEN** README — currently empty in repo
+- **DONE** README — install steps, format table, feature overview
 
 ## Documentation
 
-- **OPEN** README needs install + workflow walkthrough (currently empty)
-- **OPEN** [P] CHANGELOG / version history
-- **OPEN** [P] CLAUDE.md should point at `specs/001-editor/plan.md`
+- **DONE** README — install + workflow walkthrough, format support table
+- **DONE** [P] CHANGELOG / version history — `[Unreleased]` section populated
+- **DONE** [P] CLAUDE.md — points at `specs/001-editor/plan.md`
