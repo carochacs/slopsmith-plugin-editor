@@ -8,11 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Build progress / streaming feedback (currently a single blocking request)
-- Build retry on transient errors
-- Firefox-not-supported notice in the MIDI recording modal
-- Session TTL / cleanup (sessions currently survive for process lifetime)
-- Two-tab edit conflict detection (currently last-writer-wins)
+- **Build progress streaming** — `/build` now kicks off a background task and returns a `build_id` immediately; the frontend polls `/build-progress/{build_id}` and surfaces status updates (Writing XML, Compiling…) until done.
+- **Build retry** — the build-start request is retried up to 3× with exponential back-off on transient network errors.
+- **Two-tab edit conflict detection** — each session carries a `_version` counter incremented on every successful save; a save from a second tab returns HTTP 409 and the frontend shows a conflict warning instead of silently overwriting.
+- **Session TTL / cleanup** — a startup background task evicts sessions idle for more than 1 hour and removes their temporary directories.
+- **Better GP error reporting** — `import-gp` distinguishes truncated/malformed binary (`struct.error`), encoding issues (`UnicodeDecodeError`), and generic parse failures (includes the exception type name in the message).
+
+### Remaining open
 - Test harness for import pipelines
 
 ## [1.1.0] - 2026-06-30

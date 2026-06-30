@@ -5,9 +5,11 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -33,6 +35,7 @@ _YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
 _DRUM_TAB_ABSENT = object()
 
 _sessions = None
+_build_jobs: dict = {}  # build_id -> {status, message, path?, format?}
 
 
 def setup(app, context):
@@ -128,11 +131,28 @@ def setup(app, context):
                 return candidate
         return None
 
-    # Active editing sessions: session_id -> {dir, audio_file, filename, song_data}
+    # Active editing sessions: session_id -> {dir, audio_file, filename, song_data, _version}
     sessions = {}
 
     global _sessions
     _sessions = sessions
+
+    @app.on_event("startup")
+    async def _start_session_cleanup():
+        async def _cleanup_loop():
+            TTL = 3600  # 1 hour of inactivity
+            while True:
+                await asyncio.sleep(300)  # check every 5 minutes
+                now = time.time()
+                stale = [sid for sid, s in list(sessions.items())
+                         if now - s.get("last_touched", 0) > TTL]
+                for sid in stale:
+                    s = sessions.pop(sid, None)
+                    if s and s.get("format") != "sloppak":
+                        shutil.rmtree(s.get("dir", ""), ignore_errors=True)
+                    if s:
+                        log.info("evicted stale session %r", sid)
+        asyncio.ensure_future(_cleanup_loop())
 
     def _arrangement_id(name: str, used: set) -> str:
         """Map an arrangement name to a stable filesystem-safe id, avoiding
@@ -373,7 +393,7 @@ def setup(app, context):
                     shutil.copy2(audio_path, dest)
                     audio_url = f"{STORAGE_URL}/editor_audio_{audio_id}{ext}"
                 except Exception as e:
-                    print(f"[Editor] Audio conversion failed: {e}")
+                    log.warning("[Editor] Audio conversion failed: %s", e)
 
             # Find the arrangement XML files for later save
             xml_files = []
@@ -519,8 +539,7 @@ def setup(app, context):
                     await asyncio.get_event_loop().run_in_executor(None, _load_psarc)
                 )
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("load session failed for %r", filename)
             return JSONResponse({"error": str(e)}, 500)
 
         # Session id has to disambiguate the full relative path, not just
@@ -557,6 +576,7 @@ def setup(app, context):
                 "year": result.get("year", ""),
             },
             "last_touched": time.time(),
+            "_version": 0,
         }
         result["session_id"] = session_id
         return result
@@ -569,6 +589,20 @@ def setup(app, context):
         session = sessions.get(session_id)
         if not session:
             return JSONResponse({"error": "No active session"}, 400)
+
+        expected_version = data.get("expected_version")
+        if expected_version is not None:
+            try:
+                expected_version = int(expected_version)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if expected_version != session.get("_version", 0):
+                    return JSONResponse({
+                        "error": "Conflict: session was modified in another tab",
+                        "current_version": session.get("_version", 0),
+                    }, 409)
+
         session["last_touched"] = time.time()
 
         raw_arr_idx = data.get("arrangement_index")
@@ -1145,11 +1179,11 @@ def setup(app, context):
             else:
                 output = await asyncio.get_event_loop().run_in_executor(None, _save_psarc)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("save_cdlc failed for session %r", session_id)
             return JSONResponse({"error": str(e)}, 500)
 
-        return {"success": True, "path": output}
+        session["_version"] = session.get("_version", 0) + 1
+        return {"success": True, "path": output, "version": session["_version"]}
 
     # ── Save edited PSARC as Sloppak ──────────────────────────────────────
     #
@@ -1255,8 +1289,7 @@ def setup(app, context):
                 await asyncio.get_event_loop().run_in_executor(None, _do_save_and_repoint)
             )
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("save_as_sloppak failed for session %r", session_id)
             return JSONResponse({"error": str(e)}, 500)
 
         # Switch session into sloppak mode pointing at the new sloppak's
@@ -1491,7 +1524,7 @@ def setup(app, context):
                 else:
                     next_step = "save"
             except Exception as e:
-                print(f"[Editor] replace-audio sloppak persist failed: {e}")
+                log.exception("replace-audio sloppak persist failed")
                 return JSONResponse({"error": f"persist failed: {e}"}, 500)
 
         return {"audio_url": audio_url, "persisted": persisted, "next_step": next_step}
@@ -1515,9 +1548,17 @@ def setup(app, context):
             tracks = await asyncio.get_event_loop().run_in_executor(
                 None, _list
             )
+        except struct.error as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return JSONResponse({"error": f"Truncated or malformed GP file: {e}"}, 400)
+        except UnicodeDecodeError as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return JSONResponse({"error": f"GP file has invalid text encoding: {e}"}, 400)
         except Exception as e:
             shutil.rmtree(tmp, ignore_errors=True)
-            return JSONResponse({"error": f"Failed to parse GP file: {e}"}, 500)
+            kind = type(e).__name__
+            log.warning("GP parse failed (%s): %s", kind, e)
+            return JSONResponse({"error": f"Could not parse GP file ({kind}): {e}"}, 400)
 
         return {"gp_path": gp_path, "tracks": tracks}
 
@@ -1644,8 +1685,7 @@ def setup(app, context):
         try:
             arr_data = await asyncio.get_event_loop().run_in_executor(None, _convert)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("import_keys_midi convert failed")
             return JSONResponse({"error": str(e)}, 500)
 
         # Clean up the MIDI temp dir now that conversion is complete — the
@@ -1758,8 +1798,7 @@ def setup(app, context):
                 await asyncio.get_event_loop().run_in_executor(None, _convert)
             )
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("convert-gp failed for %r", data.get("gp_path", ""))
             return JSONResponse({"error": str(e)}, 500)
 
         session_id = f"create_{re.sub(r'[^a-z0-9]', '', (title or 'new').lower())[:30]}"
@@ -1779,6 +1818,7 @@ def setup(app, context):
                 "album": album, "year": year,
             },
             "last_touched": time.time(),
+            "_version": 0,
         }
         result["session_id"] = session_id
         result["create_mode"] = True
@@ -1908,8 +1948,7 @@ def setup(app, context):
                 await asyncio.get_event_loop().run_in_executor(None, _convert)
             )
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("import-keys GP convert failed")
             return JSONResponse({"error": str(e)}, 500)
 
         return {"arrangement": arr_data, "tmp_dir": tmp_dir, "xml_path": xml_path}
@@ -2027,8 +2066,7 @@ def setup(app, context):
                 await asyncio.get_event_loop().run_in_executor(None, _convert)
             )
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("import-guitar GP convert failed")
             return JSONResponse({"error": str(e)}, 500)
 
         return {"arrangement": arr_data, "tmp_dir": tmp_dir, "xml_path": xml_path}
@@ -2152,8 +2190,7 @@ def setup(app, context):
                 await asyncio.get_event_loop().run_in_executor(None, _convert)
             )
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("import-drums GP convert failed")
             return JSONResponse({"error": str(e)}, 500)
 
         return {"arrangement": arr_data, "tmp_dir": tmp_dir, "xml_path": xml_path}
@@ -2207,8 +2244,7 @@ def setup(app, context):
                 {"error": f"track_index {track_index} out of range"}, 400
             )
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("import-drums GP convert failed")
             # Leave the upload temp dir on failure so the user can retry.
             return JSONResponse({"error": str(e)}, 500)
 
@@ -2319,8 +2355,7 @@ def setup(app, context):
             # surface those as 400, not a 500. Upload dir left for a retry.
             return JSONResponse({"error": str(e)}, 400)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("import-drums MIDI convert failed")
             # Leave the upload temp dir in place on failure — the frontend
             # keeps `_addDrumsFile` and re-enables the Import button, so the
             # user can retry the same upload. Deleting the dir here would
@@ -2574,8 +2609,7 @@ def setup(app, context):
         try:
             result = await asyncio.get_event_loop().run_in_executor(None, _run)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("generate-difficulties failed for session %r", data.get("session_id", ""))
             return JSONResponse({"error": str(e)}, 500)
 
         return result
@@ -2791,8 +2825,7 @@ def setup(app, context):
         try:
             result = await asyncio.get_event_loop().run_in_executor(None, _run)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("library difficulty generation failed")
             return JSONResponse({"error": str(e)}, 500)
 
         return result
@@ -2801,12 +2834,15 @@ def setup(app, context):
 
     @app.post("/api/plugins/editor/build")
     async def build_cdlc_endpoint(data: dict):
-        """Build a CDLC from the current create-mode session.
+        """Start a CDLC build from the current create-mode session.
 
-        Writes a `.sloppak` when any arrangement uses extended-range strings
+        Returns immediately with a ``build_id``; the caller polls
+        ``GET /api/plugins/editor/build-progress/{build_id}`` for status.
+
+        Writes a ``.sloppak`` when any arrangement uses extended-range strings
         (7/8-string guitar or 5/6-string bass) — RS2014's SNG binary format
         is hard-locked to 6/4 strings, so a regular PSARC build via RsCli
-        would crash inside `ConvertInstrumental.xmlToSng`. Falls back to the
+        would crash inside ``ConvertInstrumental.xmlToSng``. Falls back to the
         normal PSARC build otherwise.
         """
         from lib.cdlc_builder import build_cdlc
@@ -2833,13 +2869,18 @@ def setup(app, context):
 
         needs_sloppak = any(_is_extended_range(a) for a in arrangements_data)
 
-        def _build():
-            # Write each arrangement's data to its corresponding XML
-            xml_files = session["xml_files"]
-            log.info(f"[Build] Session has {len(xml_files)} XML files")
-            log.info(f"[Build] Received {len(arrangements_data)} arrangements from frontend")
-            log.info(f"[Build] Beats: {len(beats)}, Sections: {len(sections)}")
+        build_id = uuid.uuid4().hex[:10]
+        _build_jobs[build_id] = {"status": "running", "message": "Starting build…"}
 
+        def _progress(msg: str) -> None:
+            _build_jobs[build_id]["message"] = msg
+
+        def _build():
+            xml_files = session["xml_files"]
+            log.info("[Build] Session has %d XML files", len(xml_files))
+            log.info("[Build] Received %d arrangements from frontend", len(arrangements_data))
+
+            _progress("Writing arrangement XML…")
             for i, xml_path in enumerate(xml_files):
                 tree = ET.parse(xml_path)
                 old_root = tree.getroot()
@@ -2849,32 +2890,27 @@ def setup(app, context):
                     arr_notes = arr.get("notes", [])
                     arr_chords = arr.get("chords", [])
                     arr_templates = arr.get("chord_templates", [])
-                    log.info(f"[Build] Arr {i}: {arr_notes.__len__()} notes, {arr_chords.__len__()} chords")
+                    log.info("[Build] Arr %d: %d notes, %d chords", i, len(arr_notes), len(arr_chords))
                 else:
                     arr_notes, arr_chords, arr_templates = [], [], []
-                    log.warning(f"[Build] Arr {i}: No data received from frontend")
+                    log.warning("[Build] Arr %d: no data received from frontend", i)
 
                 xml_str = _build_arrangement_xml(
                     old_root, arr_notes, arr_chords, arr_templates,
                     beats, sections, meta,
                 )
                 Path(xml_path).write_text(xml_str, encoding="utf-8")
-                log.info(f"[Build] Wrote XML to {xml_path}")
 
-            # Resolve audio file path from URL. Handles both the legacy
-            # /static/* form (web Docker) and the cache /api/plugins/editor/cache/*
-            # form (desktop bundles) — see _resolve_storage_url().
-            log.info(f"[Build] Resolving audio_url: {audio_url}")
+            _progress("Resolving audio…")
             resolved = _resolve_storage_url(audio_url) if audio_url else None
             audio_file = str(resolved) if resolved else ""
-            log.info(f"[Build] Resolved to: {audio_file}, exists: {Path(audio_file).exists() if audio_file else False}")
 
             if not audio_file or not Path(audio_file).exists():
                 raise RuntimeError(f"No audio file available for build (url={audio_url}, resolved={audio_file})")
 
-            # Get arrangement names from XMLs, deduplicate
+            # Deduplicate arrangement names from XMLs
             arr_names = []
-            name_counts = {}
+            name_counts: dict = {}
             for xp in xml_files:
                 root = ET.parse(xp).getroot()
                 el = root.find("arrangement")
@@ -2883,8 +2919,6 @@ def setup(app, context):
                 if name_counts[name] > 1:
                     name = f"{name}{name_counts[name]}"
                 arr_names.append(name)
-            log.info(f"[Build] Arrangement names: {arr_names}")
-            # Also rename in the XMLs so manifests match
             for xp, name in zip(xml_files, arr_names):
                 tree = ET.parse(xp)
                 el = tree.getroot().find("arrangement")
@@ -2898,26 +2932,18 @@ def setup(app, context):
             safe_t = re.sub(r'[<>:"/\\|?*]', '_', title)
             safe_a = re.sub(r'[<>:"/\\|?*]', '_', artist)
             output = str(dlc_dir / f"{safe_t}_{safe_a}_p.psarc")
-            log.info(f"[Build] Output path: {output}")
-            log.info(f"[Build] Title: {title}, Artist: {artist}")
 
-            # Resolve album art: use uploaded art first, then thumbnail URL as fallback
             final_art_path = ""
             if art_path and Path(art_path).exists():
                 final_art_path = art_path
-                log.info(f"[Build] Using uploaded album art: {final_art_path}")
             elif thumbnail_url:
-                # Download thumbnail to temp file
                 resolved_thumb = _resolve_storage_url(thumbnail_url) if thumbnail_url else None
                 if resolved_thumb and resolved_thumb.exists():
                     final_art_path = str(resolved_thumb)
-                    log.info(f"[Build] Using YouTube thumbnail: {final_art_path}")
                 else:
-                    log.warning(f"[Build] Thumbnail URL provided but could not resolve: {thumbnail_url}")
-            else:
-                log.info(f"[Build] No album art provided")
+                    log.warning("[Build] Thumbnail URL could not be resolved: %s", thumbnail_url)
 
-            log.info(f"[Build] Calling build_cdlc with {len(xml_files)} XMLs")
+            _progress("Compiling CDLC…")
             result = build_cdlc(
                 xml_paths=xml_files,
                 arrangement_names=arr_names,
@@ -2929,15 +2955,11 @@ def setup(app, context):
                 output_path=output,
                 album_art_path=final_art_path,
             )
-            log.info(f"[Build] build_cdlc returned: {result}")
+            log.info("[Build] build_cdlc returned: %s", result)
             return result
 
         def _build_sloppak_extended():
-            """Build a .sloppak for extended-range charts (>6 guitar / >4 bass).
-
-            Output filename is derived from title/artist for create-mode
-            sessions (no existing source filename to preserve).
-            """
+            _progress("Building sloppak…")
             resolved = _resolve_storage_url(audio_url) if audio_url else None
             audio_file = str(resolved) if resolved else ""
             if not audio_file or not Path(audio_file).exists():
@@ -2962,26 +2984,41 @@ def setup(app, context):
                 output_path=output,
             )
 
-        try:
-            target = _build_sloppak_extended if needs_sloppak else _build
-            output_path = await asyncio.get_event_loop().run_in_executor(
-                None, target
-            )
-        except IsADirectoryError as e:
-            # _write_sloppak_pak refused to clobber an authoring-form
-            # sloppak directory at the target path. Surface as 409 so
-            # the UI can prompt the user to remove/rename it.
-            return JSONResponse({"error": str(e)}, 409)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return JSONResponse({"error": str(e)}, 500)
+        async def _run_build():
+            try:
+                target = _build_sloppak_extended if needs_sloppak else _build
+                output_path = await asyncio.get_event_loop().run_in_executor(None, target)
+                _build_jobs[build_id] = {
+                    "status": "done",
+                    "message": "Build complete",
+                    "path": str(output_path),
+                    "format": "sloppak" if needs_sloppak else "psarc",
+                }
+            except IsADirectoryError as e:
+                # _write_sloppak_pak refused to clobber an authoring-form
+                # sloppak directory — surface as conflict so the UI can prompt.
+                _build_jobs[build_id] = {
+                    "status": "error",
+                    "message": str(e),
+                    "conflict": True,
+                }
+            except Exception as e:
+                log.exception("build failed for session %r", session_id)
+                _build_jobs[build_id] = {"status": "error", "message": str(e)}
 
-        return {
-            "success": True,
-            "path": output_path,
-            "format": "sloppak" if needs_sloppak else "psarc",
-        }
+        asyncio.ensure_future(_run_build())
+        return {"build_id": build_id}
+
+    @app.get("/api/plugins/editor/build-progress/{build_id}")
+    async def build_progress(build_id: str):
+        """Poll for the status of a running build started by /build."""
+        job = _build_jobs.get(build_id)
+        if not job:
+            return JSONResponse({"error": "No such build job"}, 404)
+        result = dict(job)
+        if job["status"] != "running":
+            _build_jobs.pop(build_id, None)
+        return result
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -4469,8 +4506,7 @@ def setup(app, context):
         try:
             result, session_dir, xml_files = await asyncio.get_event_loop().run_in_executor(None, _transcribe)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("transcribe failed for %r", data.get("filename", ""))
             return JSONResponse({"error": str(e)}, 500)
 
         session_id = f"transcribe_{re.sub(r'[^a-z0-9]', '', (title or 'new').lower())[:30]}"
@@ -4490,6 +4526,7 @@ def setup(app, context):
                 "album": album, "year": year_str,
             },
             "last_touched": time.time(),
+            "_version": 0,
         }
 
         result["session_id"] = session_id
