@@ -16,8 +16,8 @@ Status legend: **DONE** = shipped in v1.0.2; **OPEN** = candidate work. `[P]` = 
 - **DONE** Build button + handler — `screen.html:25`, `screen.js:editorBuild`
 - **DONE** Backend `/build` route → `lib.patcher.pack_psarc` — `routes.py:1439`
 - **DONE** Output path = user's DLC dir
-- **OPEN** [P] Build progress / streaming feedback (currently a single request)
-- **OPEN** [P] Build retry on transient errors
+- **DONE** [P] Build progress / streaming feedback — `/build` now returns `build_id`; poll `/build-progress/{build_id}`
+- **DONE** [P] Build retry on transient errors — frontend retries the start request up to 3× with exponential backoff
 
 ## US3 — Create from scratch
 
@@ -34,7 +34,7 @@ Status legend: **DONE** = shipped in v1.0.2; **OPEN** = candidate work. `[P]` = 
 - **DONE** MIDI import (guitar) — `routes.py:824`
 - **DONE** MIDI import (keys) — `routes.py:869`
 - **DONE** Drums import — `routes.py:1217`
-- **OPEN** [P] Better error reporting from malformed GP files
+- **DONE** [P] Better error reporting from malformed GP files — `struct.error`/`UnicodeDecodeError` surface specific messages; all exceptions include the exception type name
 
 ## US5 — Keys / piano-roll authoring
 
@@ -49,7 +49,7 @@ Status legend: **DONE** = shipped in v1.0.2; **OPEN** = candidate work. `[P]` = 
 - **DONE** Record button + modal — `screen.html:28`
 - **DONE** Web MIDI capture (Chrome/Edge) — `screen.js` MIDI block
 - **DONE** Save recording into session as new keys arrangement
-- **OPEN** Document Firefox-not-supported state in the modal UI
+- **DONE** Document Firefox-not-supported state in the modal UI — `#editor-record-midi-no-webmidi` shown when `!navigator.requestMIDIAccess` (screen.html:517, screen.js:4651)
 
 ## US7 — Tempo / offset / snap
 
@@ -63,13 +63,13 @@ Status legend: **DONE** = shipped in v1.0.2; **OPEN** = candidate work. `[P]` = 
 - **DONE** Storage probe (legacy static vs cache fallback) — `routes.py:54-79`
 - **DONE** Both URL prefixes resolve on read-back — `routes.py:48-52`
 - **DONE** IIFE scoping; minimal window leakage
-- **OPEN** [P] Session TTL / cleanup — currently sessions survive for process lifetime
-- **OPEN** [P] Two-tab edit conflict detection (last-writer-wins today)
-- **OPEN** Test harness for the import pipelines (no fixtures today)
-- **OPEN** README — currently empty in repo
+- **DONE** [P] Session TTL / cleanup — startup task evicts sessions untouched > 1 h; deletes temp dirs for psarc/create sessions
+- **DONE** [P] Two-tab edit conflict detection — `_version` counter on each session; save returns 409 on mismatch, frontend shows conflict message
+- **DONE** [P] Test harness for `chord_analysis.py` — `tests/test_chord_analysis.py`, 31 cases covering `fret_to_midi` (7), Pearson correlation (3), note naming (3), key name (4), chord naming (10), and `detect_key` (4). Run with `python -m pytest tests/test_chord_analysis.py`. Import pipeline tests omitted — all routes require binary GP/MIDI fixtures.
+- **DONE** README — install steps, format table, feature overview
 
 ## Documentation
 
-- **OPEN** README needs install + workflow walkthrough (currently empty)
-- **OPEN** [P] CHANGELOG / version history
-- **OPEN** [P] CLAUDE.md should point at `specs/001-editor/plan.md`
+- **DONE** README — install + workflow walkthrough, format support table
+- **DONE** [P] CHANGELOG / version history — `[Unreleased]` section populated
+- **DONE** [P] CLAUDE.md — points at `specs/001-editor/plan.md`

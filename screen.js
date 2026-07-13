@@ -71,6 +71,7 @@ const S = {
     // Song data
     title: '', artist: '', sessionId: null, filename: '',
     format: 'psarc',
+    sessionVersion: null,  // incremented by backend on each successful save; used for two-tab conflict detection
     arrangements: [],
     currentArr: 0,
     beats: [], sections: [], duration: 0, offset: 0,
@@ -2324,6 +2325,8 @@ function _buildSaveBody(forceFullSnapshot) {
             title: S.title,
             artist: S.artist,
         },
+        // Conflict guard: backend returns 409 if session was saved from another tab.
+        ...(S.sessionVersion !== null ? { expected_version: S.sessionVersion } : {}),
     };
     if (S.format === 'sloppak' || forceFullSnapshot) {
         body.arrangements = S.arrangements;
@@ -2358,8 +2361,15 @@ async function saveCDLC() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
         });
+        if (resp.status === 409) {
+            const d = await resp.json();
+            if (d.current_version !== undefined) S.sessionVersion = d.current_version;
+            setStatus('Save conflict: session was modified in another tab — reload to sync changes');
+            return;
+        }
         const data = await resp.json();
         if (data.error) { setStatus('Save error: ' + data.error); return; }
+        if (data.version !== undefined) S.sessionVersion = data.version;
         setStatus('Saved successfully');
     } catch (e) {
         setStatus('Save failed: ' + e.message);
@@ -3278,28 +3288,67 @@ window.editorBuild = async () => {
         thumbnailUrl = createState.thumbnailUrl;
     }
 
+    const buildBody = JSON.stringify({
+        session_id: S.sessionId,
+        arrangements: allArrangements,
+        beats: S.beats,
+        sections: S.sections,
+        audio_url: createState.audioUrl || '',
+        art_path: artPath,
+        thumbnail_url: thumbnailUrl,
+        metadata: {
+            title: S.title,
+            artist: S.artist,
+            artistName: S.artist,
+        },
+    });
+
     try {
-        const resp = await fetch('/api/plugins/editor/build', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                session_id: S.sessionId,
-                arrangements: allArrangements,
-                beats: S.beats,
-                sections: S.sections,
-                audio_url: createState.audioUrl || '',
-                art_path: artPath,
-                thumbnail_url: thumbnailUrl,
-                metadata: {
-                    title: S.title,
-                    artist: S.artist,
-                    artistName: S.artist,
-                },
-            }),
-        });
-        const data = await resp.json();
-        if (data.error) { setStatus('Build error: ' + data.error); return; }
-        setStatus('CDLC built: ' + data.path + ' — rescanning library…');
+        // Start the build with retry on transient network errors (up to 3 attempts).
+        let startData;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                const r = await fetch('/api/plugins/editor/build', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: buildBody,
+                });
+                startData = await r.json();
+                break;
+            } catch (e) {
+                if (attempt === 2) throw e;
+                await new Promise(res => setTimeout(res, 1000 * Math.pow(2, attempt)));
+            }
+        }
+        if (startData.error) { setStatus('Build error: ' + startData.error); return; }
+
+        const buildId = startData.build_id;
+
+        // Poll for progress until the build completes or errors.
+        let finalData = null;
+        while (true) {
+            await new Promise(res => setTimeout(res, 1000));
+            let pd;
+            try {
+                const pr = await fetch('/api/plugins/editor/build-progress/' + buildId);
+                pd = await pr.json();
+            } catch (_) {
+                continue;  // transient network hiccup — keep polling
+            }
+            if (pd.message) setStatus('Building: ' + pd.message);
+            if (pd.status === 'done') { finalData = pd; break; }
+            if (pd.status === 'error') {
+                if (pd.conflict) {
+                    setStatus('Build error: output directory already exists — remove or rename it and retry');
+                } else {
+                    setStatus('Build error: ' + (pd.message || 'unknown error'));
+                }
+                return;
+            }
+            if (pd.error) { setStatus('Build error: ' + pd.error); return; }
+        }
+
+        setStatus('CDLC built: ' + finalData.path + ' — rescanning library…');
 
         // Background rescan so the new song appears in the library immediately.
         (async () => {
@@ -3311,11 +3360,11 @@ window.editorBuild = async () => {
                     if (!sd.running) {
                         clearInterval(poll);
                         loadLibrary();
-                        setStatus('CDLC built: ' + data.path + ' — library refreshed!');
+                        setStatus('CDLC built: ' + finalData.path + ' — library refreshed!');
                     }
                 }, 1000);
             } catch (_) {
-                setStatus('CDLC built: ' + data.path + ' (library may need a manual rescan)');
+                setStatus('CDLC built: ' + finalData.path + ' (library may need a manual rescan)');
             }
         })();
     } catch (e) {
