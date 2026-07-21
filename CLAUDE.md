@@ -4,19 +4,12 @@ Full design reference: [`specs/001-editor/plan.md`](specs/001-editor/plan.md). R
 
 ## Quick orientation
 
-- **Frontend** — single IIFE in `screen.js` (~3 300 lines). All state lives in module object `S`. Canvas-based timeline with two chart modes: guitar (6 lanes, `LANE_H = 44 px`) and piano-roll (semitone rows, `PIANO_LANE_H = 10 px`; triggered by `KEYS_PATTERN`).
-- **Backend** — `routes.py` (~1 900 lines), 17 FastAPI routes. Module-scope `_sessions` dict stores live sessions; no persistent session store.
+- **Frontend** — single IIFE in `screen.js` (~5 550 lines). All state lives in module object `S`. Canvas-based timeline with two chart modes: guitar (6 lanes, `LANE_H = 44 px`) and piano-roll (semitone rows, `PIANO_LANE_H = 10 px`; triggered by `KEYS_PATTERN`).
+- **Backend** — `routes.py` (~4 530 lines), 27 FastAPI routes. Module-scope `_sessions` dict stores live sessions; no persistent session store.
 - **Sibling import** — `chord_analysis.py` is loaded via `context["load_sibling"]("chord_analysis")`, not a bare import.
 - **Storage probe** — at startup, `routes.py:54–79` checks whether `slopsmith/static/app.js` is present and writable; if so files are served from `static/`, otherwise from `config_dir/editor_cache` at `/api/plugins/editor/cache/…`.
 
-## Known open issues
-
-See `specs/001-editor/tasks.md` (OPEN items):
-- Build progress is a single blocking HTTP request — no streaming feedback.
-- Sessions survive for process lifetime; no TTL or cleanup.
-- Two-tab edit conflict: last-writer-wins.
-- No test harness for import pipelines.
-- Firefox lacks Web MIDI — the recording modal should say so.
+See `specs/001-editor/tasks.md` for shipped/candidate work — all items tracked there as of this writing are marked DONE.
 
 ## Conventions
 
