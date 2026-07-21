@@ -2127,12 +2127,13 @@ function updateArrangementSelector() {
         guitarBtn.classList.toggle('hidden', !S.sessionId || S.format !== 'sloppak');
     }
 
-    // Show "Difficulties" button for sloppak guitar/bass arrangements (not Keys).
+    // Show "Difficulties" button for sloppak guitar/bass AND keys/piano
+    // arrangements (drums have no pitch-based difficulty model).
     const genDiffBtn = document.getElementById('editor-gen-diff-btn');
     if (genDiffBtn) {
         const activeArr = S.arrangements[S.currentArr];
-        const isGuitar = activeArr && !/keys|piano|drums/i.test(activeArr.name || '');
-        genDiffBtn.classList.toggle('hidden', !S.sessionId || S.format !== 'sloppak' || !isGuitar);
+        const supported = activeArr && !/drums/i.test(activeArr.name || '');
+        genDiffBtn.classList.toggle('hidden', !S.sessionId || S.format !== 'sloppak' || !supported);
     }
 
     // Show "⋮ Strings" tuning editor whenever a guitar/bass arrangement is

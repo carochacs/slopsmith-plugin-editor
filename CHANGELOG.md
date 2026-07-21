@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Piano/keys difficulty generation** — the `⟳ Difficulties` button, and the library-wide `fix-difficulties` / `sloppak-has-phrases` tools, now support keys/piano arrangements. Scoring is pitch-based (polyphony, semitone hand span, note density/speed, sustain ease) instead of the guitar fret/string heuristics, which were meaningless against the MIDI-pitch encoding keys notes use (`midi = string*24 + fret`). Chord voicing at easy levels keeps melody (highest pitch) + bass (lowest pitch) and grows inward; fretboard-only artifacts (handshapes, fret anchors, fret-based chord naming) are skipped for keys since the piano renderer never consumes them.
 - **Build progress streaming** — `/build` now kicks off a background task and returns a `build_id` immediately; the frontend polls `/build-progress/{build_id}` and surfaces status updates (Writing XML, Compiling…) until done.
 - **Build retry** — the build-start request is retried up to 3× with exponential back-off on transient network errors.
 - **Two-tab edit conflict detection** — each session carries a `_version` counter incremented on every successful save; a save from a second tab returns HTTP 409 and the frontend shows a conflict warning instead of silently overwriting.

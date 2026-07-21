@@ -66,6 +66,21 @@ def notes_to_pitch_classes(notes: list[dict], tuning: list[int]) -> list[tuple[i
     return result
 
 
+def notes_to_pitch_classes_keys(notes: list[dict]) -> list[tuple[int, float]]:
+    """(pitch_class, weight) pairs for keys/piano notes.
+
+    Keys arrangements encode absolute MIDI pitch in the string/fret fields as
+    ``midi = string * 24 + fret`` (there is no fretboard), so pitch classes come
+    straight from that encoding rather than from tuning-relative fret math.
+    """
+    result = []
+    for n in notes:
+        midi = int(n.get("string", 0)) * 24 + int(n.get("fret", 0))
+        weight = float(n.get("sustain", 0.0)) + 0.1
+        result.append((midi % 12, weight))
+    return result
+
+
 def _pearson(a: list[float], b: list[float]) -> float:
     n = len(a)
     mean_a = sum(a) / n
@@ -78,13 +93,18 @@ def _pearson(a: list[float], b: list[float]) -> float:
     return num / (den_a * den_b)
 
 
-def detect_key(notes: list[dict], tuning: list[int]) -> tuple[int, str]:
+def detect_key(notes: list[dict], tuning: list[int], pcs=None) -> tuple[int, str]:
     """Detect key using Krumhansl-Schmuckler.
 
     Returns (root_pc, mode) where root_pc is 0–11 (C=0) and mode is 'major'|'minor'.
     Falls back to (0, 'major') when there are no notes.
+
+    ``pcs`` optionally supplies precomputed (pitch_class, weight) pairs — used by
+    keys/piano callers that derive pitch classes from the MIDI encoding via
+    ``notes_to_pitch_classes_keys`` instead of tuning-relative fret math.
     """
-    pcs = notes_to_pitch_classes(notes, tuning)
+    if pcs is None:
+        pcs = notes_to_pitch_classes(notes, tuning)
     if not pcs:
         return (0, "major")
 
