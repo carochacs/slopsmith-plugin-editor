@@ -2508,12 +2508,11 @@ def setup(app, context):
         tuning = arr_data.get("tuning", [0] * 6)
         beats = arr_data.get("beats", []) or data.get("beats", [])
         sections = arr_data.get("sections", []) or data.get("sections", [])
+        is_keys = _is_keys_arr(arr_data.get("name", ""))
 
         def _run():
             detect_key = _chord_analysis.detect_key
-            name_chord = _chord_analysis.name_chord
             key_name = _chord_analysis.key_name
-            fret_to_midi = _chord_analysis.fret_to_midi
 
             # ── Key detection ─────────────────────────────────────────
             all_notes = list(notes)
@@ -2524,14 +2523,18 @@ def setup(app, context):
                         "fret": cn.get("fret", 0),
                         "sustain": cn.get("sustain", ch.get("sustain", 0)),
                     })
-            key = detect_key(all_notes, tuning)
+            if is_keys:
+                key = detect_key(all_notes, tuning,
+                                 pcs=_chord_analysis.notes_to_pitch_classes_keys(all_notes))
+            else:
+                key = detect_key(all_notes, tuning)
             detected_key_name = key_name(key)
 
             # ── Group notes ───────────────────────────────────────────
-            groups = _group_notes_impl(notes, chords, handshapes)
+            groups = _group_notes_impl(notes, chords, handshapes, is_keys=is_keys)
 
             # ── Score groups ──────────────────────────────────────────
-            _score_groups(groups, tuning)
+            _score_groups(groups, tuning, is_keys=is_keys)
 
             # ── Build phrase windows ──────────────────────────────────
             duration = 0.0
@@ -2573,9 +2576,11 @@ def setup(app, context):
                 _assign_levels(phrase_groups, n_levels, ramp_up=(phrase_idx == 0))
                 levels_out = []
                 for lvl in range(n_levels):
-                    lvl_notes, lvl_chords = _notes_for_level(phrase_groups, lvl, tuning)
-                    lvl_anchors = _generate_anchors(lvl_notes, beat_times)
-                    lvl_handshapes = _groups_to_handshapes(
+                    lvl_notes, lvl_chords = _notes_for_level(phrase_groups, lvl, tuning, is_keys=is_keys)
+                    # Handshapes and fret anchors are fretboard concepts the piano
+                    # renderer never consumes — leave them empty for keys.
+                    lvl_anchors = [] if is_keys else _generate_anchors(lvl_notes, beat_times)
+                    lvl_handshapes = [] if is_keys else _groups_to_handshapes(
                         [g for g in phrase_groups if g["level"] <= lvl],
                         chord_templates,
                     )
@@ -2594,10 +2599,14 @@ def setup(app, context):
                 })
 
             # ── Auto-generate base handshapes (max difficulty) ────────
-            top_handshapes = _groups_to_handshapes(groups, chord_templates)
+            top_handshapes = [] if is_keys else _groups_to_handshapes(groups, chord_templates)
 
             # ── Name unnamed chord templates ──────────────────────────
-            named_templates = _name_chord_templates(chord_templates, notes, chords, tuning, key)
+            # Keys arrangements carry no fret-based chord templates to name.
+            named_templates = (
+                list(chord_templates) if is_keys
+                else _name_chord_templates(chord_templates, notes, chords, tuning, key)
+            )
 
             return {
                 "key": detected_key_name,
@@ -2627,7 +2636,9 @@ def setup(app, context):
         if not filepath.exists() or not str(filepath).startswith(str(dlc_resolved)):
             return JSONResponse({"error": "File not found"}, 400)
 
-        SKIP_NAMES = {"drum", "key", "piano"}
+        # Drums have no pitch-based difficulty model; keys/piano flow through the
+        # piano-aware difficulty path below.
+        SKIP_NAMES = {"drum"}
 
         def _check():
             source_dir = Path(sloppak_mod.resolve_source_dir(filename, dlc_dir, SLOPPAK_CACHE))
@@ -2673,7 +2684,9 @@ def setup(app, context):
         except (TypeError, ValueError):
             n_levels = 5
 
-        SKIP_NAMES = {"drum", "key", "piano"}
+        # Drums have no pitch-based difficulty model; keys/piano flow through the
+        # piano-aware difficulty path below.
+        SKIP_NAMES = {"drum"}
 
         def _run():
             source_dir = Path(sloppak_mod.resolve_source_dir(filename, dlc_dir, SLOPPAK_CACHE))
@@ -2732,6 +2745,14 @@ def setup(app, context):
                     skipped += 1
                     continue
 
+                # Keys/piano arrangements use the pitch-based difficulty path
+                # (no fretboard). Detected from the arrangement file stem, matching
+                # the substring convention the SKIP_NAMES check uses.
+                is_keys = any(
+                    s in arr_path.stem.lower()
+                    for s in ("key", "piano", "keyboard", "synth")
+                )
+
                 tuning = arr_json.get("tuning", [0] * 6)
                 notes = [_wire_note_to_editor(wn) for wn in arr_json.get("notes", [])]
                 chords = [_wire_chord_to_editor(wc) for wc in arr_json.get("chords", [])]
@@ -2751,11 +2772,17 @@ def setup(app, context):
                             "fret": cn.get("fret", 0),
                             "sustain": cn.get("sustain", 0),
                         })
-                key = _chord_analysis.detect_key(all_notes_kd, tuning)
+                if is_keys:
+                    key = _chord_analysis.detect_key(
+                        all_notes_kd, tuning,
+                        pcs=_chord_analysis.notes_to_pitch_classes_keys(all_notes_kd),
+                    )
+                else:
+                    key = _chord_analysis.detect_key(all_notes_kd, tuning)
                 last_key = _chord_analysis.key_name(key)
 
-                groups = _group_notes_impl(notes, chords, wire_handshapes)
-                _score_groups(groups, tuning)
+                groups = _group_notes_impl(notes, chords, wire_handshapes, is_keys=is_keys)
+                _score_groups(groups, tuning, is_keys=is_keys)
 
                 # Phrase windows: 30s slices (no beat/section data on disk)
                 duration = max(
@@ -2783,9 +2810,9 @@ def setup(app, context):
                     _assign_levels(phrase_groups, n_levels, ramp_up=(phrase_idx == 0))
                     levels_out = []
                     for lvl in range(n_levels):
-                        lvl_notes, lvl_chords = _notes_for_level(phrase_groups, lvl, tuning)
-                        lvl_anchors = _generate_anchors(lvl_notes, [])
-                        lvl_handshapes = _groups_to_handshapes(
+                        lvl_notes, lvl_chords = _notes_for_level(phrase_groups, lvl, tuning, is_keys=is_keys)
+                        lvl_anchors = [] if is_keys else _generate_anchors(lvl_notes, [])
+                        lvl_handshapes = [] if is_keys else _groups_to_handshapes(
                             [g for g in phrase_groups if g["level"] <= lvl],
                             chord_templates,
                         )
@@ -3227,13 +3254,188 @@ def setup(app, context):
 
     # ── Difficulty generation helpers ─────────────────────────────────
 
-    def _group_notes_impl(notes, chords, handshapes, *, time_window_ms=150, fret_span_max=4):
+    _KEYS_NAME_RE = re.compile(r"^(keys|piano|keyboard|synth)", re.IGNORECASE)
+
+    def _is_keys_arr(name):
+        """True for keys/piano arrangements (mirrors the frontend KEYS_PATTERN)."""
+        return bool(_KEYS_NAME_RE.match((name or "").strip()))
+
+    def _note_midi(n):
+        """Absolute MIDI pitch for a keys note (string/fret encode midi = s*24 + f)."""
+        return int(n.get("string", 0)) * 24 + int(n.get("fret", 0))
+
+    def _note_to_wire(n):
+        """Editor long-format note → sloppak wire format (t/s/f/sus/...)."""
+        tech = n.get("techniques", {}) or {}
+        return {
+            "t": round(float(n.get("time", 0)), 3),
+            "s": int(n.get("string", 0)),
+            "f": int(n.get("fret", 0)),
+            "sus": round(float(n.get("sustain", 0)), 3),
+            "sl": int(tech.get("slide_to", -1)),
+            "slu": int(tech.get("slide_unpitch_to", -1)),
+            "bn": round(float(tech.get("bend", 0) or 0), 1),
+            "ho": bool(tech.get("hammer_on", False)),
+            "po": bool(tech.get("pull_off", False)),
+            "hm": bool(tech.get("harmonic", False)),
+            "hp": bool(tech.get("harmonic_pinch", False)),
+            "pm": bool(tech.get("palm_mute", False)),
+            "mt": bool(tech.get("mute", False)),
+            "tr": bool(tech.get("tremolo", False)),
+            "ac": bool(tech.get("accent", False)),
+            "tp": bool(tech.get("tap", False)),
+        }
+
+    def _group_notes_keys(notes, chords, *, onset_window_ms=30):
+        """Group keys notes into atomic units for difficulty generation.
+
+        No fretboard, so grouping is purely temporal: explicit chords stay chords,
+        and remaining notes sharing an onset (within ``onset_window_ms``) become a
+        block-chord cluster. Everything else is an individual note.
+        """
+        groups = []
+        for ch in chords:
+            groups.append({
+                "type": "chord",
+                "notes": list(ch.get("notes", [])),
+                "chord": ch,
+                "time": float(ch.get("time", 0)),
+                "score": 0.0,
+                "level": 0,
+            })
+
+        note_list = sorted(
+            (dict(n) for n in notes),
+            key=lambda n: float(n.get("time", 0)),
+        )
+        n_total = len(note_list)
+        i = 0
+        while i < n_total:
+            base_t = float(note_list[i].get("time", 0))
+            cluster = [note_list[i]]
+            j = i + 1
+            while j < n_total and (float(note_list[j].get("time", 0)) - base_t) * 1000 <= onset_window_ms:
+                cluster.append(note_list[j])
+                j += 1
+            groups.append({
+                "type": "chord" if len(cluster) > 1 else "note",
+                "notes": cluster,
+                "chord": None,
+                "time": base_t,
+                "score": 0.0,
+                "level": 0,
+            })
+            i = j
+
+        groups.sort(key=lambda g: g["time"])
+        return groups
+
+    def _score_groups_keys(groups):
+        """Compute pitch/rhythm-based difficulty scores in-place (0–1 per group).
+
+        Keys difficulty is driven by how many notes sound at once (polyphony), how
+        wide the reach is (hand span in semitones), how dense/fast the passage is,
+        and sustain ease — not fretboard position.
+        """
+        total = len(groups)
+        for gi, g in enumerate(groups):
+            notes_list = g["notes"]
+            if not notes_list:
+                g["score"] = 0.0
+                continue
+
+            midis = [_note_midi(n) for n in notes_list]
+
+            # Polyphony — 1 note = 0.0, 5+ simultaneous = 1.0
+            poly = min(1.0, (len(notes_list) - 1) / 4.0)
+
+            # Hand span — semitone reach across the group; an octave = 1.0
+            span = (max(midis) - min(midis)) if len(midis) > 1 else 0
+            span_score = min(1.0, span / 12.0)
+
+            # Note density — compare to nearby groups
+            density_window = 5
+            lo = max(0, gi - density_window)
+            hi = min(total, gi + density_window + 1)
+            nearby_count = sum(len(groups[k]["notes"]) for k in range(lo, hi))
+            density = min(1.0, nearby_count / max(density_window * 4, 1))
+
+            # Speed — short onset gap to the next group ramps difficulty up
+            speed = 0.0
+            if gi + 1 < total:
+                dt = float(groups[gi + 1]["time"]) - float(g["time"])
+                if dt > 0:
+                    speed = min(1.0, max(0.0, (0.25 - dt) / 0.25))
+
+            # Sustain ease — long held notes are easier
+            max_sus = max(float(n.get("sustain", 0)) for n in notes_list)
+            sustain_ease = min(1.0, max_sus / 2.0)
+
+            g["score"] = (
+                0.30 * poly
+                + 0.25 * span_score
+                + 0.20 * density
+                + 0.15 * speed
+                + 0.10 * (1.0 - sustain_ease)
+            )
+
+    def _notes_for_level_keys(groups, level):
+        """Return (notes_wire, []) for keys notes at or below ``level``.
+
+        Chords/clusters are thinned by pitch: level 0 keeps melody (highest MIDI) +
+        bass (lowest MIDI), level 1 adds one inner voice, higher levels keep the full
+        voicing — mirroring how simplified piano sheet music is arranged.
+        """
+        out_notes = []
+        for g in groups:
+            if g["level"] > level:
+                continue
+            g_notes = list(g["notes"])
+            g_time = float(g.get("time", 0))
+            # Explicit chords key note times off the chord (their notes may omit or
+            # zero their own time); clustered/loose notes keep their own onset.
+            is_explicit_chord = g.get("chord") is not None
+            if len(g_notes) > 1:
+                ranked = sorted(g_notes, key=_note_midi)
+                if level == 0:
+                    keep = [ranked[0], ranked[-1]]
+                elif level == 1 and len(ranked) > 3:
+                    keep = [ranked[0], ranked[len(ranked) // 2], ranked[-1]]
+                else:
+                    keep = ranked
+                # Preserve order/identity, drop duplicates (bass == melody edge case)
+                seen = set()
+                deduped = []
+                for n in keep:
+                    if id(n) not in seen:
+                        seen.add(id(n))
+                        deduped.append(n)
+                g_notes = deduped
+            for n in g_notes:
+                merged = dict(n)
+                if is_explicit_chord or merged.get("time") is None:
+                    merged["time"] = g_time
+                out_notes.append(merged)
+
+        out_notes_wire = [
+            _note_to_wire(n)
+            for n in sorted(out_notes, key=lambda n: float(n.get("time", 0)))
+        ]
+        return out_notes_wire, []
+
+    def _group_notes_impl(notes, chords, handshapes, *, time_window_ms=150, fret_span_max=4, is_keys=False):
         """Group notes into atomic units for difficulty generation.
 
         Priority: chords → link_next chains → handshape windows
         → time-proximity clusters → individual notes.
         Each group: {type, notes, chord, time, score, level}.
+
+        Keys/piano arrangements have no fretboard, so they use a purely temporal
+        grouping (see ``_group_notes_keys``).
         """
+        if is_keys:
+            return _group_notes_keys(notes, chords)
+
         groups = []
         assigned_note_indices = set()
         assigned_chord_indices = set()
@@ -3377,8 +3579,11 @@ def setup(app, context):
         groups.sort(key=lambda g: g["time"])
         return groups
 
-    def _score_groups(groups, tuning):
+    def _score_groups(groups, tuning, *, is_keys=False):
         """Compute composite difficulty scores in-place (0–1 per group)."""
+        if is_keys:
+            _score_groups_keys(groups)
+            return
         n_strings = len(tuning)
 
         def _fret_score(fret):
@@ -3467,13 +3672,19 @@ def setup(app, context):
                     lvl += 1
             g["level"] = min(lvl, max_lvl)
 
-    def _notes_for_level(groups, level, tuning):
+    def _notes_for_level(groups, level, tuning, *, is_keys=False):
         """Return (notes_list, chords_list) for notes at or below the given level.
 
         Chord groups are flattened to individual notes so phrase levels have no
         chord_id references. This avoids stale chord_id / chord-template index
         mismatches when reconstructChords() reindexes templates before save.
+
+        Keys/piano arrangements thin chords by pitch instead of string index
+        (see ``_notes_for_level_keys``).
         """
+        if is_keys:
+            return _notes_for_level_keys(groups, level)
+
         out_notes = []
         for g in groups:
             if g["level"] > level:

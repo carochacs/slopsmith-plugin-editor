@@ -165,3 +165,38 @@ def test_detect_key_returns_tuple():
     root_pc, mode = result
     assert 0 <= root_pc <= 11
     assert mode in ("major", "minor")
+
+
+# ── keys/piano pitch classes (midi = string*24 + fret) ─────────────────────────
+
+def test_notes_to_pitch_classes_keys_encoding():
+    # C4=60 -> s=2,f=12 ; E4=64 -> s=2,f=16 ; G4=67 -> s=2,f=19
+    notes = [
+        {"string": 2, "fret": 12, "sustain": 1.0},
+        {"string": 2, "fret": 16, "sustain": 1.0},
+        {"string": 2, "fret": 19, "sustain": 1.0},
+    ]
+    pcs = ca.notes_to_pitch_classes_keys(notes)
+    assert sorted(pc for pc, _ in pcs) == [0, 4, 7]  # C, E, G
+    # weight = sustain + 0.1
+    assert all(abs(w - 1.1) < 1e-9 for _, w in pcs)
+
+def test_notes_to_pitch_classes_keys_wraps_octaves():
+    # midi 72 (C5) also pc 0 — encoded as s=3,f=0
+    pcs = ca.notes_to_pitch_classes_keys([{"string": 3, "fret": 0, "sustain": 0}])
+    assert pcs[0][0] == 0
+
+def test_detect_key_accepts_precomputed_pcs():
+    # C major triad via keys encoding, passed as pcs — must not use fret math.
+    notes = [
+        {"string": 2, "fret": 12, "sustain": 1.0},
+        {"string": 2, "fret": 16, "sustain": 1.0},
+        {"string": 2, "fret": 19, "sustain": 1.0},
+    ]
+    key = ca.detect_key(notes, [0] * 6, pcs=ca.notes_to_pitch_classes_keys(notes))
+    assert ca.key_name(key) == "C"
+
+def test_detect_key_pcs_none_falls_back_to_fret_math():
+    # Explicit pcs=None must behave exactly like omitting it.
+    notes = [{"string": 0, "fret": 5, "sustain": 0.1}]
+    assert ca.detect_key(notes, STD) == ca.detect_key(notes, STD, pcs=None)
