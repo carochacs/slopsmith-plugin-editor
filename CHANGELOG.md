@@ -14,9 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Two-tab edit conflict detection** — each session carries a `_version` counter incremented on every successful save; a save from a second tab returns HTTP 409 and the frontend shows a conflict warning instead of silently overwriting.
 - **Session TTL / cleanup** — a startup background task evicts sessions idle for more than 1 hour and removes their temporary directories.
 - **Better GP error reporting** — `import-gp` distinguishes truncated/malformed binary (`struct.error`), encoding issues (`UnicodeDecodeError`), and generic parse failures (includes the exception type name in the message).
-
-### Remaining open
-- Test harness for import pipelines
+- **Test harness for `chord_analysis.py`** — `tests/test_chord_analysis.py`, 31 cases covering `fret_to_midi`, Pearson correlation, note naming, key name, chord naming, and `detect_key`. Import-pipeline tests were deliberately scoped out — every import route requires binary GP/MIDI fixtures.
 
 ## [1.1.0] - 2026-06-30
 
