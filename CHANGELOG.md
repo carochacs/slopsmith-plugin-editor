@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Better GP error reporting** — `import-gp` distinguishes truncated/malformed binary (`struct.error`), encoding issues (`UnicodeDecodeError`), and generic parse failures (includes the exception type name in the message).
 - **Test harness for `chord_analysis.py`** — `tests/test_chord_analysis.py`, 31 cases covering `fret_to_midi`, Pearson correlation, note naming, key name, chord naming, and `detect_key`. Import-pipeline tests were deliberately scoped out — every import route requires binary GP/MIDI fixtures.
 
+### Fixed
+- **Sync Tempo / offset / manual BPM only fixed the currently-viewed arrangement** — `editorApplySync`, `editorApplyOffset`, and `editorSetBPM` rescaled `notes()` (the current arrangement only) while also rescaling the song-wide `S.beats`/`S.sections`. On multi-arrangement songs this desynced every arrangement except the one on screen, and re-running the tool afterward couldn't recover the correct factor since the shared beat grid was already corrected. All three now rescale every arrangement's notes/chords together via a shared `_scaleAllArrangementTimes` helper.
+
 ## [1.1.0] - 2026-06-30
 
 ### Added

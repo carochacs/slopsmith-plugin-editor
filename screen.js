@@ -357,6 +357,32 @@ function flattenChords() {
     arr.notes.sort((a, b) => a.time - b.time);
 }
 
+// Rescale note/chord times across every arrangement in the song (not just
+// S.currentArr). S.beats/S.sections are song-wide — every arrangement was
+// authored against that same shared grid — so a tempo/offset correction
+// must move every arrangement's notes together or the ones the user isn't
+// currently viewing end up desynced from the (now-corrected) beat grid,
+// with no way to recover the right factor afterward (getTabBPM() would
+// just read back the already-corrected grid).
+function _scaleAllArrangementTimes(factor, offset) {
+    for (const arr of S.arrangements) {
+        for (const n of arr.notes) {
+            n.time = n.time / factor + offset;
+            if (n.sustain) n.sustain = n.sustain / factor;
+        }
+        for (const ch of arr.chords) {
+            ch.time = ch.time / factor + offset;
+            for (const cn of ch.notes) {
+                // cn.time is falsy when the chord note has no time of its
+                // own (flattenChords falls back to ch.time in that case) —
+                // leave it falsy rather than scaling 0 into a bogus offset.
+                if (cn.time) cn.time = cn.time / factor + offset;
+                if (cn.sustain) cn.sustain = cn.sustain / factor;
+            }
+        }
+    }
+}
+
 // Reconstruct chords from notes at the same time before saving
 function reconstructChords() {
     if (!S.arrangements.length) return;
@@ -2551,12 +2577,9 @@ window.editorSetBPM = (val) => {
     const factor = oldBPM / newBPM;
     if (Math.abs(factor - 1) < 0.001) return;
 
-    // Scale all times
-    const nn = notes();
-    for (const n of nn) {
-        n.time *= factor;
-        if (n.sustain) n.sustain *= factor;
-    }
+    // Scale all times across every arrangement — factor is defined here as
+    // oldBPM/newBPM, i.e. t_new = t_old * factor, which is t_old / (1/factor).
+    _scaleAllArrangementTimes(1 / factor, 0);
     for (const b of S.beats) b.time *= factor;
     for (const s of S.sections) s.start_time *= factor;
 
@@ -2568,8 +2591,7 @@ window.editorApplyOffset = (val) => {
     const currentOffset = parseFloat(document.getElementById('editor-offset').dataset.applied || '0');
     const delta = offset - currentOffset;
     if (Math.abs(delta) < 0.0001) return;
-    const nn = notes();
-    for (const n of nn) n.time += delta;
+    _scaleAllArrangementTimes(1, delta);
     for (const b of S.beats) b.time += delta;
     for (const s of S.sections) s.start_time += delta;
     document.getElementById('editor-offset').dataset.applied = String(offset);
@@ -2790,12 +2812,8 @@ window.editorApplySync = () => {
 
     if (factor <= 0 || !isFinite(factor)) return;
 
-    // Scale all note times and sustains
-    const nn = notes();
-    for (const n of nn) {
-        n.time = n.time / factor + offset;
-        if (n.sustain) n.sustain = n.sustain / factor;
-    }
+    // Scale all note times and sustains across every arrangement
+    _scaleAllArrangementTimes(factor, offset);
 
     // Scale beat times
     for (const b of S.beats) {
