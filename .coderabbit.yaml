@@ -1,0 +1,86 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit config for the Slopsmith Arrangement Editor plugin.
+# Goal: keep automated review signal high without re-litigating conventions
+# that are already deliberate project decisions (see CLAUDE.md /
+# specs/001-editor/plan.md). Claude Code agents working this repo are
+# expected to address CodeRabbit comments like any other reviewer's —
+# reply or fix, don't ignore — see "Working with CodeRabbit" in CLAUDE.md.
+
+language: en-US
+early_access: false
+
+tone_instructions: >-
+  This repo is developed by a solo maintainer working with Claude Code
+  agents. PR descriptions may be AI-written; review the diff on its own
+  merits rather than the prose around it. Prioritize correctness bugs,
+  security issues (this plugin parses untrusted audio/chart uploads), and
+  violations of the conventions below over style nits.
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!**/*.min.js"
+    - "!**/*.min.css"
+    - "!**/node_modules/**"
+    - "!CHANGELOG.md"
+  path_instructions:
+    - path: "routes.py"
+      instructions: |
+        FastAPI backend for a Slopsmith plugin (~4500 lines, 27 routes).
+        Conventions that are intentional, not review findings:
+        - All logging goes through `context["log"]` (a stdlib Logger passed
+          into `setup(app, context)`). A bare `print()` call IS a real bug
+          here — core routes plugin output through the app's log
+          pipeline/correlation IDs, so `print()` silently breaks that. Flag it.
+        - Sibling modules (e.g. `chord_analysis.py`) are loaded via
+          `context["load_sibling"]("chord_analysis")`, never a bare
+          `import chord_analysis`. A bare import of a same-directory helper
+          module is the bug to flag (it collides with other plugins'
+          same-named modules in `sys.modules`); `load_sibling` itself is
+          correct as-is.
+        - Minimal docstrings are the house style — don't request docstrings
+          on functions whose name/types already convey behavior.
+        - The `slopsmith/static/app.js`-presence probe at the top of the
+          file (lines ~54-79) deliberately falls back to
+          `config_dir/editor_cache` when core's static dir isn't writable —
+          that dual-path storage logic is intentional, not dead code.
+        - `_sessions` is an in-process, module-scope dict (no persistent
+          store) — flag genuine race conditions on concurrent access, not
+          the absence of a database.
+    - path: "screen.js"
+      instructions: |
+        Single IIFE (~5500 lines), loaded as a plain `<script>` tag — no
+        bundler, no ES modules, no npm dependencies. Don't suggest
+        splitting into modules, adding a build step, or importing packages;
+        that's an explicit project constraint (see CLAUDE.md), not an
+        oversight. All state lives in the module object `S` by design.
+        Do flag: unhandled promise rejections, event-listener leaks across
+        the two chart modes (guitar/piano-roll), and any place a
+        `window.playSong` wrapper skips `await`-ing the original.
+    - path: "chord_analysis.py"
+      instructions: |
+        Loaded exclusively via `context["load_sibling"]("chord_analysis")`
+        from routes.py — never imported directly by other plugins. Treat it
+        as an internal module of this plugin, not a public library surface.
+    - path: "specs/**"
+      instructions: |
+        Design/planning docs (speckit output), not shipped code. Skip
+        code-quality style comments here; only flag factual
+        inconsistencies with the actual implementation if you can verify them.
+    - path: "**/*.md"
+      instructions: |
+        Documentation. Don't flag missing code examples or ask for docstring
+        coverage — this project's code-comment policy is deliberately
+        minimal (see CLAUDE.md).
+
+chat:
+  auto_reply: true
