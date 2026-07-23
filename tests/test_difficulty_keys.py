@@ -7,18 +7,28 @@ extract the self-contained keys helpers straight from the routes.py source via
 AST and exercise the real code. Guitar helpers are intentionally not covered
 here — this file targets the piano path that ``test_chord_analysis.py`` can't
 reach.
+
+``_note_midi``/``_note_to_wire`` used to be nested defs here too, extracted
+the same ast-and-exec way as everything else below. They've since been
+promoted to real top-level functions in chord_analysis.py (note_midi_keys /
+note_to_wire) — routes.py now just aliases them locally — so they're imported
+directly instead. The remaining extracted functions call them by their old
+local names, so `_load_keys_helpers` still has to seed those two names into
+the exec namespace for those calls to resolve.
 """
 
 import ast
+import sys
 import textwrap
 from pathlib import Path
 
 _ROUTES = Path(__file__).parent.parent / "routes.py"
 
+sys.path.insert(0, str(_ROUTES.parent))
+import chord_analysis as ca
+
 # Self-contained nested helpers that make up the keys difficulty pipeline.
 _WANTED = {
-    "_note_midi",
-    "_note_to_wire",
     "_group_notes_keys",
     "_score_groups_keys",
     "_assign_levels",
@@ -34,7 +44,11 @@ def _load_keys_helpers():
         n for n in tree.body
         if isinstance(n, ast.FunctionDef) and n.name == "setup"
     )
-    ns = {}
+    # These two now live in chord_analysis.py as real exports (see module
+    # docstring above) — seed them under their old local names so the
+    # ast-extracted functions below (which still call `_note_midi(...)` /
+    # `_note_to_wire(...)`) resolve them.
+    ns = {"_note_midi": ca.note_midi_keys, "_note_to_wire": ca.note_to_wire}
     for node in setup_fn.body:
         if isinstance(node, ast.FunctionDef) and node.name in _WANTED:
             code = textwrap.dedent(ast.get_source_segment(src, node))
@@ -52,11 +66,11 @@ def _kn(string, fret, sustain=0.0, time=0.0):
     return {"string": string, "fret": fret, "sustain": sustain, "time": time}
 
 
-# ── _note_midi ─────────────────────────────────────────────────────────────
+# ── note_midi_keys (plain import — see module docstring) ────────────────────
 
 def test_note_midi_encoding():
-    assert H["_note_midi"](_kn(2, 12)) == 60   # C4
-    assert H["_note_midi"](_kn(3, 0)) == 72     # C5
+    assert ca.note_midi_keys(_kn(2, 12)) == 60   # C4
+    assert ca.note_midi_keys(_kn(3, 0)) == 72     # C5
 
 
 # ── grouping: block chords cluster by onset ──────────────────────────────────

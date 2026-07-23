@@ -48,7 +48,10 @@ const LABEL_W = 52;
 const MIN_NOTE_W = 18;
 const NOTE_PAD = 3;
 const SNAP_VALUES = [1, 0.5, 0.25, 0.125, 0.0625, 0]; // 1/1 … 1/16, off
-const DPR = window.devicePixelRatio || 1;
+// Refreshed by resizeCanvas() (and the resolution-change listener set up
+// below) rather than read once, so dragging the window to a different-DPI
+// monitor or changing OS/browser zoom doesn't leave the canvas blurry.
+let DPR = window.devicePixelRatio || 1;
 
 // ── Piano roll constants ────────────────────────────────────────────
 const PIANO_NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
@@ -112,6 +115,15 @@ const S = {
 
     // History
     history: null,
+    // Bumped on every undoable edit (see bumpEditGen()). A cheap way for
+    // memoized/cached code to detect "something changed" on an in-place
+    // mutation (e.g. a note's .time changing) that doesn't change array
+    // identity/length.
+    editGen: 0,
+    // True once there's session state a plain page-close would lose, even
+    // if the edit itself didn't go through S.history (e.g. a live MIDI
+    // take, or an import). See markSessionDirty()/sessionIsDirty().
+    sessionDirty: false,
 
     // Songs list cache
     songsList: null,
@@ -119,6 +131,12 @@ const S = {
     // Clipboard
     clipboard: null, // { notes: [...], baseTime }
 };
+
+function bumpEditGen() { S.editGen++; }
+
+function markSessionDirty() { S.sessionDirty = true; }
+
+function sessionIsDirty() { return !!S.sessionDirty; }
 
 let canvas, ctx;
 let rafId = null;
@@ -863,10 +881,68 @@ function hitNoteEdge(mx, my) {
 // ════════════════════════════════════════════════════════════════════
 
 class EditHistory {
+    // Cap the stack so an unbounded session (hours of editing) doesn't
+    // grow the undo array without limit; oldest entries are evicted first.
+    static MAX_UNDO = 500;
     constructor() { this.undo = []; this.redo = []; }
-    exec(cmd) { cmd.exec(); this.undo.push(cmd); this.redo = []; this._afterEdit(); this._ui(); }
-    doUndo() { if (!this.undo.length) return; const c = this.undo.pop(); c.rollback(); this.redo.push(c); this._afterEdit(); this._ui(); draw(); }
-    doRedo() { if (!this.redo.length) return; const c = this.redo.pop(); c.exec(); this.undo.push(c); this._afterEdit(); this._ui(); draw(); }
+    exec(cmd) {
+        // Tag the command with the arrangement it was executed against.
+        // Commands built on notes()/S.sel resolve via S.currentArr, so
+        // undoing/redoing after switching arrangements would otherwise
+        // silently act on the WRONG arrangement's notes (the same root
+        // cause KNOWN_ISSUES.md #4 describes for the context menu).
+        cmd._arrIdx = S.currentArr;
+        cmd.exec();
+        this.undo.push(cmd);
+        if (this.undo.length > EditHistory.MAX_UNDO) this.undo.shift();
+        this.redo = [];
+        bumpEditGen();
+        markSessionDirty();
+        this._afterEdit();
+        this._ui();
+    }
+    doUndo() {
+        if (!this.undo.length) return;
+        const c = this.undo.pop();
+        this._ensureArr(c);
+        c.rollback();
+        this.redo.push(c);
+        bumpEditGen();
+        markSessionDirty();
+        this._afterEdit();
+        this._ui();
+        draw();
+    }
+    doRedo() {
+        if (!this.redo.length) return;
+        const c = this.redo.pop();
+        this._ensureArr(c);
+        c.exec();
+        this.undo.push(c);
+        bumpEditGen();
+        markSessionDirty();
+        this._afterEdit();
+        this._ui();
+        draw();
+    }
+    // Switch the visible arrangement back to the one a command was
+    // executed against, if it's no longer active, before undoing/redoing
+    // it — mirrors the popover-close/mode-reset editorSelectArrangement
+    // now does, so the user sees where the undo/redo actually happened
+    // instead of it silently mutating a hidden arrangement.
+    _ensureArr(cmd) {
+        if (cmd._arrIdx === undefined || cmd._arrIdx === S.currentArr) return;
+        if (cmd._arrIdx < 0 || cmd._arrIdx >= S.arrangements.length) return;
+        hideContextMenu();
+        hideAddNote();
+        S.drumEditMode = false;
+        S.drumSel = new Set();
+        S.currentArr = cmd._arrIdx;
+        S.sel.clear();
+        flattenChords();
+        if (isKeysMode()) updatePianoRange();
+        updateArrangementSelector();
+    }
     _afterEdit() {
         // Keep the keys viewport in sync with the current note range so
         // multi-octave authoring works without manual range control.
@@ -964,6 +1040,215 @@ class ChangeFretCmd {
     }
     exec() { notes()[this.index].fret = this.newFret; }
     rollback() { notes()[this.index].fret = this.oldFret; }
+}
+
+// Wraps a global time transform (BPM rescale or offset nudge) as a single
+// undoable step. Snapshots every touched time field up front and restores
+// them exactly on rollback, rather than re-deriving an inverse factor/
+// offset — avoids compounding floating-point drift across repeated
+// undo/redo. `applyFn` performs the actual mutation (via
+// _scaleAllArrangementTimes plus the beats/sections loops the caller
+// already had) and may also update auxiliary UI state (e.g. the offset
+// input's cumulative dataset value) as part of the same atomic step.
+class RescaleTimesCmd {
+    constructor(applyFn) {
+        this._applyFn = applyFn;
+        this._before = RescaleTimesCmd._snapshot();
+        this._after = null;
+    }
+    static _snapshot() {
+        return {
+            arrangements: S.arrangements.map(arr => ({
+                notes: (arr.notes || []).map(n => ({ time: n.time, sustain: n.sustain })),
+                chords: (arr.chords || []).map(ch => ({
+                    time: ch.time,
+                    notes: (ch.notes || []).map(cn => ({ time: cn.time, sustain: cn.sustain })),
+                })),
+            })),
+            beats: S.beats.map(b => b.time),
+            sections: S.sections.map(s => s.start_time),
+            offsetApplied: (document.getElementById('editor-offset') || {}).dataset
+                ? document.getElementById('editor-offset').dataset.applied
+                : undefined,
+        };
+    }
+    static _restore(snap) {
+        S.arrangements.forEach((arr, ai) => {
+            const as = snap.arrangements[ai];
+            if (!as) return;
+            (arr.notes || []).forEach((n, i) => {
+                if (!as.notes[i]) return;
+                n.time = as.notes[i].time;
+                n.sustain = as.notes[i].sustain;
+            });
+            (arr.chords || []).forEach((ch, i) => {
+                const cs = as.chords[i];
+                if (!cs) return;
+                ch.time = cs.time;
+                (ch.notes || []).forEach((cn, j) => {
+                    if (!cs.notes[j]) return;
+                    cn.time = cs.notes[j].time;
+                    cn.sustain = cs.notes[j].sustain;
+                });
+            });
+        });
+        S.beats.forEach((b, i) => { if (snap.beats[i] !== undefined) b.time = snap.beats[i]; });
+        S.sections.forEach((s, i) => { if (snap.sections[i] !== undefined) s.start_time = snap.sections[i]; });
+        const offsetEl = document.getElementById('editor-offset');
+        if (offsetEl && snap.offsetApplied !== undefined) offsetEl.dataset.applied = snap.offsetApplied;
+    }
+    exec() {
+        if (this._after) {
+            RescaleTimesCmd._restore(this._after);
+        } else {
+            this._applyFn();
+            this._after = RescaleTimesCmd._snapshot();
+        }
+    }
+    rollback() {
+        RescaleTimesCmd._restore(this._before);
+    }
+}
+
+class AddSectionCmd {
+    constructor(section) { this.section = section; }
+    exec() {
+        S.sections.push(this.section);
+        S.sections.sort((a, b) => a.start_time - b.start_time);
+    }
+    rollback() {
+        const i = S.sections.indexOf(this.section);
+        if (i >= 0) S.sections.splice(i, 1);
+    }
+}
+
+class RenameSectionCmd {
+    constructor(section, newName) {
+        this.section = section;
+        this.newName = newName;
+        this.oldName = section.name;
+    }
+    exec() { this.section.name = this.newName; }
+    rollback() { this.section.name = this.oldName; }
+}
+
+class DeleteSectionCmd {
+    constructor(section) {
+        this.section = section;
+        this.index = -1;
+    }
+    exec() {
+        this.index = S.sections.indexOf(this.section);
+        if (this.index >= 0) S.sections.splice(this.index, 1);
+    }
+    rollback() {
+        if (this.index >= 0) S.sections.splice(this.index, 0, this.section);
+    }
+}
+
+class AddDrumHitCmd {
+    constructor(hit) { this.hit = hit; }
+    exec() {
+        if (!Array.isArray(S.drumTab.hits)) S.drumTab.hits = [];
+        S.drumTab.hits.push(this.hit);
+        S.drumTab.hits.sort((a, b) => a.t - b.t);
+        S.drumTabDirty = true;
+        updateArrangementSelector();
+    }
+    rollback() {
+        const i = S.drumTab.hits.indexOf(this.hit);
+        if (i >= 0) S.drumTab.hits.splice(i, 1);
+        S.drumTabDirty = true;
+        updateArrangementSelector();
+    }
+}
+
+class DeleteDrumHitsCmd {
+    constructor(indices) {
+        // Snapshot the full hits array — simplest correct restore given a
+        // deletion shifts every later index, so per-index bookkeeping
+        // would have to happen in delete order anyway.
+        this._before = S.drumTab.hits.slice();
+        this._deleteSet = new Set(indices);
+    }
+    exec() {
+        S.drumTab.hits = S.drumTab.hits.filter((_, i) => !this._deleteSet.has(i));
+        S.drumSel = new Set();
+        S.drumTabDirty = true;
+        updateArrangementSelector();
+    }
+    rollback() {
+        S.drumTab.hits = this._before.slice();
+        S.drumTabDirty = true;
+        updateArrangementSelector();
+    }
+}
+
+class ToggleDrumArticulationCmd {
+    constructor(kind, indices) {
+        this.field = kind === 'g' ? 'g' : kind === 'f' ? 'f' : 'k';
+        this.indices = [...indices];
+        this._before = this.indices.map(i => {
+            const h = S.drumTab.hits[i];
+            return h ? h[this.field] : undefined;
+        });
+    }
+    exec() {
+        for (const idx of this.indices) {
+            const h = S.drumTab.hits[idx];
+            if (!h) continue;
+            if (this.field === 'k') {
+                const meta = DRUM_PIECE_META[h.p];
+                if (!meta || meta.cat !== 'cymbal') continue;
+                if (h.k) delete h.k; else h.k = 0.08;
+            } else {
+                if (h[this.field]) delete h[this.field]; else h[this.field] = true;
+            }
+        }
+        S.drumTabDirty = true;
+    }
+    rollback() {
+        this.indices.forEach((idx, k) => {
+            const h = S.drumTab.hits[idx];
+            if (!h) return;
+            const val = this._before[k];
+            if (val === undefined) delete h[this.field]; else h[this.field] = val;
+        });
+        S.drumTabDirty = true;
+    }
+}
+
+// Wraps a finished drum-hit drag (see _drumEditorOnDragEnd). `items` is
+// [{ref, origTime, origPiece}] — ref is the actual hit object, which stays
+// stable across the post-move re-sort's index remap (unlike an index).
+class MoveDrumHitsCmd {
+    constructor(items) {
+        this.items = items.map(it => ({
+            ref: it.ref,
+            origTime: it.origTime,
+            origPiece: it.origPiece,
+            newTime: it.ref.t,
+            newPiece: it.ref.p,
+        }));
+    }
+    exec() {
+        for (const it of this.items) { it.ref.t = it.newTime; it.ref.p = it.newPiece; }
+        this._resort();
+    }
+    rollback() {
+        for (const it of this.items) { it.ref.t = it.origTime; it.ref.p = it.origPiece; }
+        this._resort();
+    }
+    _resort() {
+        if (!S.drumTab || !Array.isArray(S.drumTab.hits)) return;
+        const sentinel = Symbol('drumSel');
+        const selSet = new Set(this.items.map(it => it.ref));
+        for (const h of S.drumTab.hits) if (selSet.has(h)) h[sentinel] = true;
+        S.drumTab.hits.sort((a, b) => a.t - b.t);
+        S.drumSel = new Set();
+        S.drumTab.hits.forEach((h, i) => { if (h[sentinel]) { S.drumSel.add(i); delete h[sentinel]; } });
+        S.drumTabDirty = true;
+    }
 }
 
 // Extend an arrangement's string count by one. `position` is 'low' for
@@ -1572,15 +1857,14 @@ function showSectionMenu(cx, cy, time) {
                 const name = prompt('Section name:', 'verse');
                 if (!name) return;
                 const num = S.sections.filter(s => s.name === name).length + 1;
-                S.sections.push({ name, number: num, start_time: snapTime(time) });
-                S.sections.sort((a, b) => a.start_time - b.start_time);
+                S.history.exec(new AddSectionCmd({ name, number: num, start_time: snapTime(time) }));
                 draw();
             } else if (btn.dataset.action === 'rename' && nearSection) {
                 const name = prompt('New name:', nearSection.name);
-                if (name) { nearSection.name = name; draw(); }
+                if (name) { S.history.exec(new RenameSectionCmd(nearSection, name)); draw(); }
             } else if (btn.dataset.action === 'delete' && nearSection) {
-                const i = S.sections.indexOf(nearSection);
-                if (i >= 0) { S.sections.splice(i, 1); draw(); }
+                S.history.exec(new DeleteSectionCmd(nearSection));
+                draw();
             }
         };
     });
@@ -1607,8 +1891,8 @@ function onKeyDown(e) {
     if (_recState === 'recording') return;
 
     if (e.key === 'Delete' || e.key === 'Backspace') {
-        // Drum-edit mode: delete selected drum hits in place. No undo
-        // (would need a sibling DrumEditCmd class — out of scope for this PR).
+        // Drum-edit mode: delete selected drum hits (undoable via
+        // DeleteDrumHitsCmd, same as the guitar/keys delete path below).
         // Guard against focus being inside a form control (mirrors the note-
         // delete path below) so typing in a text input doesn't delete hits.
         if (S.drumEditMode && S.drumSel.size && S.drumTab &&
@@ -1646,12 +1930,12 @@ function onKeyDown(e) {
         }
     }
 
-    if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.target.matches('input, select, textarea')) {
         e.preventDefault();
         editorUndo();
         return;
     }
-    if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key === 'Z'))) {
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key === 'Z')) && !e.target.matches('input, select, textarea')) {
         e.preventDefault();
         editorRedo();
         return;
@@ -1732,6 +2016,15 @@ function onKeyDown(e) {
 // Context menu
 // ════════════════════════════════════════════════════════════════════
 
+// Clamp a popover's top-left so it stays fully on-screen. Must be called
+// after the element is unhidden (and has its final content), since it reads
+// offsetWidth/offsetHeight — a hidden (display:none) element measures 0.
+function _clampPopoverPos(el, x, y) {
+    const maxLeft = Math.max(0, window.innerWidth - el.offsetWidth);
+    const maxTop = Math.max(0, window.innerHeight - el.offsetHeight);
+    return { x: Math.max(0, Math.min(x, maxLeft)), y: Math.max(0, Math.min(y, maxTop)) };
+}
+
 function showContextMenu(cx, cy, idx) {
     const menu = document.getElementById('editor-context-menu');
     const items = [
@@ -1773,9 +2066,10 @@ function showContextMenu(cx, cy, idx) {
         btn.onclick = () => { hideContextMenu(); actionItem.action(); };
     });
 
-    menu.style.left = cx + 'px';
-    menu.style.top = cy + 'px';
     menu.classList.remove('hidden');
+    const pos = _clampPopoverPos(menu, cx, cy);
+    menu.style.left = pos.x + 'px';
+    menu.style.top = pos.y + 'px';
 }
 
 function hideContextMenu() {
@@ -1828,8 +2122,6 @@ function showAddNote(cx, cy, time, string, fret) {
     const isKeys = isKeysMode();
     addNoteData = { time, string, fret, isKeys };
     const dlg = document.getElementById('editor-add-note-dialog');
-    dlg.style.left = cx + 'px';
-    dlg.style.top = cy + 'px';
     dlg.classList.remove('hidden');
 
     document.getElementById('editor-add-fret-col').classList.toggle('hidden', isKeys);
@@ -1847,6 +2139,11 @@ function showAddNote(cx, cy, time, string, fret) {
         inp.focus();
         inp.select();
     }
+
+    // Position last, once toggled columns have settled the dialog's final size.
+    const pos = _clampPopoverPos(dlg, cx, cy);
+    dlg.style.left = pos.x + 'px';
+    dlg.style.top = pos.y + 'px';
 }
 
 function hideAddNote() {
@@ -1882,9 +2179,23 @@ document.addEventListener('keydown', (e) => {
         editorConfirmAddNote();
     }
     if (e.key === 'Escape') {
+        // Close whatever's open. Every modal already exposes an idempotent
+        // editorHideXModal (each is a no-op if already hidden, and
+        // editorHideRecordMidiModal already refuses to close mid-take) —
+        // route them all through Escape instead of the previous 3-of-~10
+        // subset (KNOWN_ISSUES.md #8).
         hideAddNote();
         hideContextMenu();
         editorHideLoadModal();
+        editorHideSaveFormatModal();
+        editorHideSyncDialog();
+        editorHideCreateModal();
+        editorHideReplaceAudioModal();
+        editorHideAddDrumsModal();
+        editorHideStringsModal();
+        editorHideAddKeysModal();
+        editorHideAddGuitarModal();
+        editorHideRecordMidiModal();
     }
 });
 
@@ -2397,6 +2708,7 @@ async function saveCDLC() {
         const data = await resp.json();
         if (data.error) { setStatus('Save error: ' + data.error); return; }
         if (data.version !== undefined) S.sessionVersion = data.version;
+        S.sessionDirty = false;
         setStatus('Saved successfully');
     } catch (e) {
         setStatus('Save failed: ' + e.message);
@@ -2524,6 +2836,7 @@ function updateBPMDisplay() {
 
 function resizeCanvas() {
     if (!canvas) return;
+    DPR = window.devicePixelRatio || 1;
     const wrap = document.getElementById('editor-canvas-wrap');
     const w = wrap.clientWidth;
     const h = wrap.clientHeight;
@@ -2579,9 +2892,11 @@ window.editorSetBPM = (val) => {
 
     // Scale all times across every arrangement — factor is defined here as
     // oldBPM/newBPM, i.e. t_new = t_old * factor, which is t_old / (1/factor).
-    _scaleAllArrangementTimes(1 / factor, 0);
-    for (const b of S.beats) b.time *= factor;
-    for (const s of S.sections) s.start_time *= factor;
+    S.history.exec(new RescaleTimesCmd(() => {
+        _scaleAllArrangementTimes(1 / factor, 0);
+        for (const b of S.beats) b.time *= factor;
+        for (const s of S.sections) s.start_time *= factor;
+    }));
 
     draw();
     setStatus(`Tempo changed: ${oldBPM.toFixed(1)} → ${newBPM.toFixed(1)} BPM`);
@@ -2591,10 +2906,12 @@ window.editorApplyOffset = (val) => {
     const currentOffset = parseFloat(document.getElementById('editor-offset').dataset.applied || '0');
     const delta = offset - currentOffset;
     if (Math.abs(delta) < 0.0001) return;
-    _scaleAllArrangementTimes(1, delta);
-    for (const b of S.beats) b.time += delta;
-    for (const s of S.sections) s.start_time += delta;
-    document.getElementById('editor-offset').dataset.applied = String(offset);
+    S.history.exec(new RescaleTimesCmd(() => {
+        _scaleAllArrangementTimes(1, delta);
+        for (const b of S.beats) b.time += delta;
+        for (const s of S.sections) s.start_time += delta;
+        document.getElementById('editor-offset').dataset.applied = String(offset);
+    }));
     draw();
     setStatus(`Offset: ${offset >= 0 ? '+' : ''}${(offset * 1000).toFixed(0)}ms`);
 };
@@ -2617,6 +2934,14 @@ window.editorNudgeOffset = (delta) => {
     editorApplyOffset(el.value);
 };
 window.editorSelectArrangement = (val) => {
+    // Close any popover before switching: showContextMenu/showAddNote close
+    // over a note index into the OLD arrangement's notes() array, and
+    // drumEditMode/drumSel describe the OLD arrangement's chart type — left
+    // open/set, either would act on (or render) the wrong arrangement.
+    hideContextMenu();
+    hideAddNote();
+    S.drumEditMode = false;
+    S.drumSel = new Set();
     S.currentArr = parseInt(val) || 0;
     S.sel.clear();
     flattenChords();
@@ -2636,6 +2961,18 @@ window.editorToggleTech = (idx, tech) => {
 window.editSong = (filename) => {
     showScreen('plugin-editor');
     loadCDLC(filename);
+};
+
+// Bound to the "Back" button (screen.html) instead of a bare
+// showScreen('home') so unsaved work (S.sessionDirty — see markSessionDirty)
+// isn't silently lost by a single misclick. The backend's own TTL sweep
+// (routes.py) still reclaims an abandoned session's temp dir independently
+// of whether the user confirms or cancels here.
+window.editorGoBack = () => {
+    if (sessionIsDirty() && !confirm('You have unsaved changes. Leave without saving?')) {
+        return;
+    }
+    showScreen('home');
 };
 
 // ════════════════════════════════════════════════════════════════════
@@ -3248,6 +3585,9 @@ window.editorDoCreate = async () => {
 
         if (data.audio_url) await loadAudio(data.audio_url);
         draw();
+        // A fresh create-mode import has unbuilt work in memory before the
+        // user makes a single edit — bypasses S.history like a MIDI take does.
+        markSessionDirty();
         setStatus('Imported — edit notes then click Build CDLC');
     } catch (e) {
         status.textContent = 'Import failed: ' + e.message;
@@ -3257,6 +3597,12 @@ window.editorDoCreate = async () => {
 
 window.editorBuild = async () => {
     if (!S.sessionId || !S.createMode) return;
+    const buildBtn = document.getElementById('editor-build-btn');
+    // Double-submit guard: classList only controls visibility elsewhere, so a
+    // second click (or a click mid-poll) would otherwise race two concurrent
+    // build+poll loops against the same #editor-status.
+    if (buildBtn && buildBtn.disabled) return;
+    if (buildBtn) buildBtn.disabled = true;
     setStatus('Building CDLC...');
 
     // Reconstruct chords for ALL arrangements before sending
@@ -3367,6 +3713,7 @@ window.editorBuild = async () => {
             if (pd.error) { setStatus('Build error: ' + pd.error); return; }
         }
 
+        S.sessionDirty = false;
         setStatus('CDLC built: ' + finalData.path + ' — rescanning library…');
 
         // Background rescan so the new song appears in the library immediately.
@@ -3392,6 +3739,7 @@ window.editorBuild = async () => {
         // Re-flatten current arrangement for continued editing
         flattenChords();
         draw();
+        if (buildBtn) buildBtn.disabled = false;
     }
 };
 
@@ -3526,21 +3874,60 @@ function init() {
     canvas.addEventListener('contextmenu', onContextMenu);
     document.addEventListener('keydown', onKeyDown);
 
+    // Warn on an actual tab close/reload while there's unsaved work. This
+    // only covers leaving the PAGE — leaving the editor SCREEN for another
+    // in-app screen (the "Back" button) is a separate path, guarded by
+    // editorGoBack() below, since showScreen('home') doesn't unload the page.
+    window.addEventListener('beforeunload', (e) => {
+        if (!sessionIsDirty()) return;
+        e.preventDefault();
+        e.returnValue = '';
+    });
+
     // Prevent middle-click paste
     canvas.addEventListener('auxclick', (e) => { if (e.button === 1) e.preventDefault(); });
 
     resizeCanvas();
     window.addEventListener('resize', resizeCanvas);
 
-    // Observe screen visibility for resize
+    // A plain 'resize' listener misses a DPR change with no viewport-size
+    // change (dragging the window to a different-DPI monitor, or an OS/
+    // browser zoom change). matchMedia has no generic "any resolution
+    // change" event, so re-arm a query for the CURRENT ratio each time it
+    // fires — resizeCanvas() re-reads devicePixelRatio into DPR.
+    if (typeof matchMedia === 'function') {
+        let dprQuery;
+        const onDprChange = () => { resizeCanvas(); armDprListener(); };
+        function armDprListener() {
+            if (dprQuery) dprQuery.removeEventListener('change', onDprChange);
+            dprQuery = matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+            dprQuery.addEventListener('change', onDprChange);
+        }
+        armDprListener();
+    }
+
+    // Observe screen visibility: resize on entry, and — since there's no
+    // other hook for losing the `.active` class — tear down playback/MIDI
+    // recording on exit. Without this, navigating away mid-play or mid-take
+    // leaves the AudioContext/rAF loop running and a take recording into a
+    // session the user can no longer see (KNOWN_ISSUES.md #1).
+    let _wasScreenActive = false;
     const obs = new MutationObserver(() => {
         const screen = document.getElementById('plugin-editor');
-        if (screen && screen.classList.contains('active')) {
+        const isActive = !!(screen && screen.classList.contains('active'));
+        if (isActive && !_wasScreenActive) {
             setTimeout(resizeCanvas, 50);
+        } else if (!isActive && _wasScreenActive) {
+            try { if (_recState === 'recording') editorStopRecordMidi(); } catch (_) {}
+            try { stopPlayback(); } catch (_) {}
         }
+        _wasScreenActive = isActive;
     });
     const screen = document.getElementById('plugin-editor');
-    if (screen) obs.observe(screen, { attributes: true, attributeFilter: ['class'] });
+    if (screen) {
+        _wasScreenActive = screen.classList.contains('active');
+        obs.observe(screen, { attributes: true, attributeFilter: ['class'] });
+    }
 
     draw();
 }
@@ -4904,6 +5291,10 @@ window.editorStopRecordMidi = () => {
     _recNotes.sort((a, b) => a.time - b.time);
     const arr = S.arrangements[_recArrIdx];
     if (arr) arr.notes = _recNotes;
+    // A recorded take bypasses S.history entirely (there's no single command
+    // that could represent "record N notes over M minutes"), so it wouldn't
+    // otherwise register as unsaved work.
+    markSessionDirty();
 
     // Flush the final note count to the modal before hiding it.
     _recCountLastMs = 0;
@@ -5216,12 +5607,7 @@ function _drumEditorAddHit(x, y) {
     // Clamp after snapping: when the first beat is offset from 0, snapTime
     // can round backward past zero and produce a negative timestamp.
     let t = Math.max(0, snapTime(Math.max(0, rawT)));
-    if (!Array.isArray(S.drumTab.hits)) S.drumTab.hits = [];
-    S.drumTab.hits.push({ t: Math.round(t * 1000) / 1000, p: piece, v: 100 });
-    S.drumTab.hits.sort((a, b) => a.t - b.t);
-    S.drumTabDirty = true;
-    // Keep the ⟳ Drums (N) toolbar count in sync after adding a hit.
-    updateArrangementSelector();
+    S.history.exec(new AddDrumHitCmd({ t: Math.round(t * 1000) / 1000, p: piece, v: 100 }));
     return true;
 }
 
@@ -5344,24 +5730,15 @@ function _drumEditorOnDragMove(x, y) {
 // when S.drag.type === 'drum-move'.
 function _drumEditorOnDragEnd() {
     if (!S.drag || S.drag.type !== 'drum-move' || !S.drumTab) return;
-    const moved = !!S.drag.moved;
-    if (moved) {
-        S.drumTabDirty = true;
-        const hits = S.drumTab.hits;
-        // Tag selected hits with a transient marker so we can recover their
-        // indices after the sort.
-        const sentinel = Symbol('drumSel');
-        for (const idx of S.drag.indices) {
-            if (hits[idx]) hits[idx][sentinel] = true;
-        }
-        hits.sort((a, b) => a.t - b.t);
-        S.drumSel = new Set();
-        for (let i = 0; i < hits.length; i++) {
-            if (hits[i][sentinel]) {
-                S.drumSel.add(i);
-                delete hits[i][sentinel];
-            }
-        }
+    if (S.drag.moved && Array.isArray(S.drumTab.hits)) {
+        const items = S.drag.indices
+            .map((idx, k) => ({
+                ref: S.drumTab.hits[idx],
+                origTime: S.drag.origTimes[k],
+                origPiece: S.drag.origPieces[k],
+            }))
+            .filter(it => it.ref);
+        if (items.length) S.history.exec(new MoveDrumHitsCmd(items));
     }
     S.drag = null;
     draw();
@@ -5370,32 +5747,14 @@ function _drumEditorOnDragEnd() {
 function _drumEditorDeleteSelection() {
     if (!S.drumTab || !S.drumSel.size) return;
     if (!Array.isArray(S.drumTab.hits)) return;
-    const drop = S.drumSel;
-    S.drumTab.hits = S.drumTab.hits.filter((_, i) => !drop.has(i));
-    S.drumSel = new Set();
-    S.drumTabDirty = true;
-    // Keep the ⟳ Drums (N) toolbar count in sync after deleting hits.
-    updateArrangementSelector();
+    S.history.exec(new DeleteDrumHitsCmd([...S.drumSel]));
 }
 
 function _drumEditorToggleArticulation(kind) {
-    if (!S.drumTab) return;
+    if (!S.drumTab || !S.drumSel.size) return;
     // Guard a malformed/older drum_tab with missing/non-array `hits`.
     if (!Array.isArray(S.drumTab.hits)) return;
-    if (S.drumSel.size) S.drumTabDirty = true;
-    const field = kind === 'g' ? 'g' : kind === 'f' ? 'f' : 'k';
-    for (const idx of S.drumSel) {
-        const h = S.drumTab.hits[idx];
-        if (!h) continue;
-        if (field === 'k') {
-            // Choke is only meaningful on cymbal pieces; ignored on drums.
-            const meta = DRUM_PIECE_META[h.p];
-            if (!meta || meta.cat !== 'cymbal') continue;
-            if (h.k) delete h.k; else h.k = 0.08;
-        } else {
-            if (h[field]) delete h[field]; else h[field] = true;
-        }
-    }
+    S.history.exec(new ToggleDrumArticulationCmd(kind, [...S.drumSel]));
 }
 
 // ── Drum-edit toggle button (injected next to the +Drums button) ─────

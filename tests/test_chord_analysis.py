@@ -88,6 +88,20 @@ def test_key_name_bb_major():
     # Bb major (pc=10) is a flat key
     assert ca.key_name((10, "major")) == "Bb"
 
+# ── _prefers_sharp (formula-based spelling replacing the old SHARP_KEYS set) ──
+
+def test_prefers_sharp_matches_relative_major_for_minor():
+    # E minor's relative major is G (pc 7), a sharp key → E minor is sharp.
+    assert ca._prefers_sharp((4, "minor")) is True
+
+def test_prefers_sharp_flat_minor_key():
+    # D minor's relative major is F (pc 5), a flat key → D minor is flat.
+    assert ca._prefers_sharp((2, "minor")) is False
+
+def test_prefers_sharp_unknown_mode_defaults_like_major():
+    # An unrecognized mode falls back to offset 0 (major's convention).
+    assert ca._prefers_sharp((7, "dorian")) is True
+
 # ── name_chord ────────────────────────────────────────────────────────────────
 
 _C_MAJOR_KEY = (0, "major")
@@ -123,6 +137,25 @@ def test_name_chord_power_chord():
 def test_name_chord_sus4():
     # Csus4: 0,5,7 → "sus4"
     assert ca.name_chord(frozenset({0, 5, 7}), _C_MAJOR_KEY, lowest_pc=0) == "Csus4"
+
+def test_name_chord_major_sixth():
+    # C6: C(0) E(4) G(7) A(9), bass C → intervals {0,4,7,9} → "6"
+    assert ca.name_chord(frozenset({0, 4, 7, 9}), _C_MAJOR_KEY, lowest_pc=0) == "C6"
+
+def test_name_chord_minor_sixth():
+    # Cm6: C(0) Eb(3) G(7) A(9), bass C → intervals {0,3,7,9} → "m6"
+    assert ca.name_chord(frozenset({0, 3, 7, 9}), _C_MAJOR_KEY, lowest_pc=0) == "Cm6"
+
+def test_name_chord_minor_major_seventh():
+    # CmMaj7: C(0) Eb(3) G(7) B(11), bass C → intervals {0,3,7,11} → "mMaj7"
+    assert ca.name_chord(frozenset({0, 3, 7, 11}), _C_MAJOR_KEY, lowest_pc=0) == "CmMaj7"
+
+def test_name_chord_six_vs_relative_m7_disambiguated_by_bass():
+    # Same 4 pitch classes (C,E,G,A) either read as C6 (bass=C) or Am7
+    # (bass=A) — lowest_pc (the sounding bass note) must be what decides.
+    pcs = frozenset({0, 4, 7, 9})
+    assert ca.name_chord(pcs, _C_MAJOR_KEY, lowest_pc=0) == "C6"
+    assert ca.name_chord(pcs, _C_MAJOR_KEY, lowest_pc=9) == "Am7"
 
 def test_name_chord_no_match_fallback():
     # Unusual set with no quality match → slash notation
@@ -200,3 +233,23 @@ def test_detect_key_pcs_none_falls_back_to_fret_math():
     # Explicit pcs=None must behave exactly like omitting it.
     notes = [{"string": 0, "fret": 5, "sustain": 0.1}]
     assert ca.detect_key(notes, STD) == ca.detect_key(notes, STD, pcs=None)
+
+
+# ── note_to_wire ───────────────────────────────────────────────────────────
+
+def test_note_to_wire_basic_fields():
+    note = {"time": 1.5, "string": 2, "fret": 3, "sustain": 0.25}
+    wire = ca.note_to_wire(note)
+    assert wire["t"] == 1.5
+    assert wire["s"] == 2
+    assert wire["f"] == 3
+    assert wire["sus"] == 0.25
+    assert wire["ho"] is False and wire["po"] is False
+
+def test_note_to_wire_techniques():
+    note = {"techniques": {"hammer_on": True, "bend": 0.5, "slide_to": 7}}
+    wire = ca.note_to_wire(note)
+    assert wire["ho"] is True
+    assert wire["bn"] == 0.5
+    assert wire["sl"] == 7
+    assert wire["slu"] == -1  # default when absent
