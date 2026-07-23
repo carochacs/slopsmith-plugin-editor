@@ -78,9 +78,10 @@ onto `EditHistory`), so this is a maturity upgrade, not a rewrite:
     the editor screen or closing the tab (`beforeunload` + an explicit
     `POST` to close the backend session), mirroring the fork's
     `guardSessionTransition()`/`disposeBackendSession()` pattern. Slopsmith
-    currently has no equivalent — it relies solely on the backend's 5-minute
-    TTL sweep (`routes.py:140-155`), which is good but not a substitute for
-    an explicit close signal.
+    currently has no equivalent — it relies solely on the backend's cleanup
+    loop (`routes.py:140-155`, checks every 5 minutes and evicts sessions
+    idle over 1 hour), which is good but not a substitute for an explicit
+    close signal.
 
     **Do not remove or weaken the existing TTL eviction loop while doing
     this** — the fork actually dropped its own equivalent sweep, which is a
@@ -110,9 +111,8 @@ onto `EditHistory`), so this is a maturity upgrade, not a rewrite:
 
 ## P5 — Testing & CI
 
-17. Add a CI workflow (there is currently none) that just runs the existing
-    `pytest tests/` — near-zero cost, catches regressions in
-    `chord_analysis.py` and the difficulty-scoring helpers immediately.
+17. **Done** — added `.github/workflows/ci.yml`, running both `pytest
+    tests/` (Python) and `npm test` (`node --test`, JS) on every push/PR.
 18. Continue extracting pure, state-free logic out of `routes.py`'s
     `setup()`-nested closures into real top-level functions in
     `chord_analysis.py` or a new sibling module (loaded via
