@@ -1944,6 +1944,7 @@ function editLyricWord(idx) {
     S.lyrics.sort((a, b) => (a.t || 0) - (b.t || 0));
     S.lyricSel = S.lyrics.indexOf(word);
     S.lyricsDirty = true;
+    markSessionDirty();
     draw();
     setStatus('Lyric updated');
 }
@@ -2108,6 +2109,7 @@ function onKeyDown(e) {
             S.lyrics.splice(S.lyricSel, 1);
             S.lyricSel = -1;
             S.lyricsDirty = true;
+            markSessionDirty();
             draw();
             return;
         }
