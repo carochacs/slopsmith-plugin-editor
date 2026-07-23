@@ -3392,31 +3392,12 @@ def setup(app, context):
         """True for keys/piano arrangements (mirrors the frontend KEYS_PATTERN)."""
         return bool(_KEYS_NAME_RE.match((name or "").strip()))
 
-    def _note_midi(n):
-        """Absolute MIDI pitch for a keys note (string/fret encode midi = s*24 + f)."""
-        return int(n.get("string", 0)) * 24 + int(n.get("fret", 0))
-
-    def _note_to_wire(n):
-        """Editor long-format note → sloppak wire format (t/s/f/sus/...)."""
-        tech = n.get("techniques", {}) or {}
-        return {
-            "t": round(float(n.get("time", 0)), 3),
-            "s": int(n.get("string", 0)),
-            "f": int(n.get("fret", 0)),
-            "sus": round(float(n.get("sustain", 0)), 3),
-            "sl": int(tech.get("slide_to", -1)),
-            "slu": int(tech.get("slide_unpitch_to", -1)),
-            "bn": round(float(tech.get("bend", 0) or 0), 1),
-            "ho": bool(tech.get("hammer_on", False)),
-            "po": bool(tech.get("pull_off", False)),
-            "hm": bool(tech.get("harmonic", False)),
-            "hp": bool(tech.get("harmonic_pinch", False)),
-            "pm": bool(tech.get("palm_mute", False)),
-            "mt": bool(tech.get("mute", False)),
-            "tr": bool(tech.get("tremolo", False)),
-            "ac": bool(tech.get("accent", False)),
-            "tp": bool(tech.get("tap", False)),
-        }
+    # Moved to chord_analysis.py (note_midi_keys / note_to_wire) — both were
+    # already pure/state-free, so extracting them turns the corresponding
+    # test_difficulty_keys.py cases from an ast-extract-and-exec workaround
+    # into a plain import (see chord_analysis.py's module docstring context).
+    _note_midi = _chord_analysis.note_midi_keys
+    _note_to_wire = _chord_analysis.note_to_wire
 
     def _group_notes_keys(notes, chords, *, onset_window_ms=30):
         """Group keys notes into atomic units for difficulty generation.
