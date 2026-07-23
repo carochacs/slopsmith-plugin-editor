@@ -51,6 +51,23 @@ def setup(app, context):
 
     _chord_analysis = context["load_sibling"]("chord_analysis")
 
+    def _resolve_sandboxed_path(base_dir, rel):
+        """Resolve `rel` against `base_dir`, rejecting any path that escapes it.
+
+        Shared by the lyrics.json read/write paths — a manifest-supplied
+        relative path (e.g. `lyrics: lyrics.json`) must never be trusted to
+        stay inside the sloppak's own directory.
+        """
+        if not rel:
+            return None
+        base_resolved = Path(base_dir).resolve()
+        candidate = (Path(base_dir) / rel).resolve()
+        try:
+            candidate.relative_to(base_resolved)
+        except ValueError:
+            return None
+        return candidate
+
     # The editor needs to write extracted audio / art into a directory it
     # can also serve from. On the web Docker image `slopsmith/static/` is
     # writable, so historically the plugin reused that path and surfaced
@@ -489,6 +506,19 @@ def setup(app, context):
             _loaded_drum_tab = getattr(loaded, "drum_tab", None)
             if _loaded_drum_tab is not None:
                 result["drum_tab"] = _loaded_drum_tab
+            # Surface karaoke lyrics (word-level {t, d, w} timing) if the
+            # manifest references a lyrics file — e.g. produced by
+            # TabGrabber's sloppak exporter. Read-only pass-through here;
+            # save() writes edits back to this same file without ever
+            # touching the manifest's `lyrics` key itself.
+            _lyrics_path = _resolve_sandboxed_path(loaded.source_dir, loaded.manifest.get("lyrics"))
+            if _lyrics_path is not None and _lyrics_path.exists():
+                try:
+                    _lyrics_data = json.loads(_lyrics_path.read_text(encoding="utf-8"))
+                    if isinstance(_lyrics_data, list):
+                        result["lyrics"] = _lyrics_data
+                except (OSError, json.JSONDecodeError) as e:
+                    log.warning("[Editor] Failed to read lyrics.json: %s", e)
             # Carry the manifest-derived arrangement id list onto each
             # arrangement so the frontend can round-trip it back to us.
             # Use a single `used_ids` set when generating fallback ids so two
@@ -663,6 +693,21 @@ def setup(app, context):
         ):
             return JSONResponse(
                 {"error": "drum_tab can only be saved to sloppak-format songs"},
+                status_code=400,
+            )
+
+        # Lyrics payload: edited karaoke word-timing list from the frontend.
+        # Absent key → no-op (matches drum_tab's sentinel convention, just
+        # without the create/remove states — lyrics.json is edit-only, see
+        # `_save_sloppak` below). Only ever applies to sloppak sessions,
+        # since that's the only format the .sloppak lyrics.json convention
+        # exists for.
+        lyrics_payload = data.get("lyrics")
+        if lyrics_payload is not None and not isinstance(lyrics_payload, list):
+            return JSONResponse({"error": "lyrics must be a list"}, 400)
+        if lyrics_payload is not None and session.get("format") != "sloppak":
+            return JSONResponse(
+                {"error": "lyrics can only be saved to sloppak-format songs"},
                 status_code=400,
             )
         # Schema-validate a dict payload at the request boundary, using the
@@ -1125,6 +1170,20 @@ def setup(app, context):
                 else:
                     drum_tab_path.unlink(missing_ok=True)
                     manifest.pop("drum_tab", None)
+
+            # Lyrics persist: edit-only, refreshes the file the manifest's
+            # `lyrics` key already points at (e.g. TabGrabber's lyrics.json).
+            # Never adds or removes the manifest key itself — authoring new
+            # lyrics from a song that never had any is out of scope.
+            if lyrics_payload is not None and manifest.get("lyrics"):
+                _lyrics_path = _resolve_sandboxed_path(source_dir, manifest.get("lyrics"))
+                if _lyrics_path is None:
+                    raise RuntimeError("lyrics path escapes sandbox")
+                _lyrics_path.parent.mkdir(parents=True, exist_ok=True)
+                _lyrics_path.write_text(
+                    json.dumps(lyrics_payload, separators=(",", ":")),
+                    encoding="utf-8",
+                )
 
             # Apply edited top-level metadata (title/artist/album/year only —
             # don't let the editor overwrite stems/lyrics/cover paths).
@@ -2619,6 +2678,79 @@ def setup(app, context):
             result = await asyncio.get_event_loop().run_in_executor(None, _run)
         except Exception as e:
             log.exception("generate-difficulties failed for session %r", data.get("session_id", ""))
+            return JSONResponse({"error": str(e)}, 500)
+
+        return result
+
+    # ── Detect song key and label chords over the timeline ───────────
+    #
+    # Read-only sibling of generate-difficulties: reuses the same key
+    # detection and note-grouping helpers, but doesn't mutate phrases/
+    # handshapes and works for any format (not just sloppak), so it can
+    # run right after a plain load instead of requiring the user to click
+    # "⋮ Difficulties" first.
+
+    @app.post("/api/plugins/editor/analyze-chords")
+    async def analyze_chords(data: dict):
+        arr_data = data.get("arrangement")
+        if not arr_data:
+            return JSONResponse({"error": "arrangement data required"}, 400)
+
+        notes = arr_data.get("notes", [])
+        chords = arr_data.get("chords", [])
+        handshapes = arr_data.get("handshapes", [])
+        tuning = arr_data.get("tuning", [0] * 6)
+        is_keys = _is_keys_arr(arr_data.get("name", ""))
+
+        def _run():
+            detect_key = _chord_analysis.detect_key
+            key_name = _chord_analysis.key_name
+            name_chord = _chord_analysis.name_chord
+            fret_to_midi = _chord_analysis.fret_to_midi
+
+            # ── Key detection (same approach as generate-difficulties) ──
+            all_notes = list(notes)
+            for ch in chords:
+                for cn in ch.get("notes", []):
+                    all_notes.append({
+                        "string": cn.get("string", 0),
+                        "fret": cn.get("fret", 0),
+                        "sustain": cn.get("sustain", ch.get("sustain", 0)),
+                    })
+            if is_keys:
+                key = detect_key(all_notes, tuning,
+                                 pcs=_chord_analysis.notes_to_pitch_classes_keys(all_notes))
+            else:
+                key = detect_key(all_notes, tuning)
+            detected_key_name = key_name(key)
+
+            # ── Label simultaneous-note groups as chords ─────────────
+            groups = _group_notes_impl(notes, chords, handshapes, is_keys=is_keys)
+            chords_out = []
+            for g in groups:
+                g_notes = g.get("notes") or []
+                if len(g_notes) < 2:
+                    continue  # a single note isn't a chord
+                if is_keys:
+                    midis = [int(n.get("string", 0)) * 24 + int(n.get("fret", 0)) for n in g_notes]
+                else:
+                    midis = [fret_to_midi(n.get("string", 0), n.get("fret", 0), tuning) for n in g_notes]
+                if not midis:
+                    continue
+                pcs = frozenset(m % 12 for m in midis)
+                lowest_pc = min(midis) % 12
+                chords_out.append({
+                    "time": round(float(g.get("time", 0)), 3),
+                    "name": name_chord(pcs, key, lowest_pc),
+                })
+            chords_out.sort(key=lambda c: c["time"])
+
+            return {"key": detected_key_name, "chords": chords_out}
+
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(None, _run)
+        except Exception as e:
+            log.exception("analyze-chords failed")
             return JSONResponse({"error": str(e)}, 500)
 
         return result
