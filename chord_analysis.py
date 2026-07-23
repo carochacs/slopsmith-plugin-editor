@@ -26,6 +26,7 @@ _FLAT_MAJOR_PCS = {3, 5, 8, 10}
 
 
 def _prefers_sharp(key: tuple[int, str]) -> bool:
+    """Whether `key` (root_pc, mode) should spell accidentals sharp rather than flat."""
     root_pc, mode = key
     offset = _RELATIVE_MAJOR_OFFSET.get(mode, 0)
     return (root_pc + offset) % 12 not in _FLAT_MAJOR_PCS

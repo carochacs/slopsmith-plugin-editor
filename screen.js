@@ -132,10 +132,13 @@ const S = {
     clipboard: null, // { notes: [...], baseTime }
 };
 
+/** Increment S.editGen — call on any in-place mutation callers may need to detect. */
 function bumpEditGen() { S.editGen++; }
 
+/** Flag the session as having unsaved work, independent of S.history. */
 function markSessionDirty() { S.sessionDirty = true; }
 
+/** Whether the session has unsaved work (see markSessionDirty). */
 function sessionIsDirty() { return !!S.sessionDirty; }
 
 let canvas, ctx;
@@ -880,11 +883,16 @@ function hitNoteEdge(mx, my) {
 // Undo / Redo
 // ════════════════════════════════════════════════════════════════════
 
+/**
+ * Undo/redo stack. Commands are duck-typed objects exposing exec()/rollback();
+ * `exec` runs and pushes a command, `doUndo`/`doRedo` pop and replay it.
+ */
 class EditHistory {
     // Cap the stack so an unbounded session (hours of editing) doesn't
     // grow the undo array without limit; oldest entries are evicted first.
     static MAX_UNDO = 500;
     constructor() { this.undo = []; this.redo = []; }
+    /** Run `cmd.exec()`, push it onto the undo stack, and clear the redo stack. */
     exec(cmd) {
         // Tag the command with the arrangement it was executed against.
         // Commands built on notes()/S.sel resolve via S.currentArr, so
@@ -901,6 +909,7 @@ class EditHistory {
         this._afterEdit();
         this._ui();
     }
+    /** Pop and roll back the most recent command, pushing it onto the redo stack. */
     doUndo() {
         if (!this.undo.length) return;
         const c = this.undo.pop();
@@ -913,6 +922,7 @@ class EditHistory {
         this._ui();
         draw();
     }
+    /** Pop and re-run the most recently undone command, pushing it back onto the undo stack. */
     doRedo() {
         if (!this.redo.length) return;
         const c = this.redo.pop();
@@ -930,6 +940,7 @@ class EditHistory {
     // it — mirrors the popover-close/mode-reset editorSelectArrangement
     // now does, so the user sees where the undo/redo actually happened
     // instead of it silently mutating a hidden arrangement.
+    /** Switch to `cmd`'s target arrangement first if it's not the active one. */
     _ensureArr(cmd) {
         if (cmd._arrIdx === undefined || cmd._arrIdx === S.currentArr) return;
         if (cmd._arrIdx < 0 || cmd._arrIdx >= S.arrangements.length) return;
@@ -943,6 +954,7 @@ class EditHistory {
         if (isKeysMode()) updatePianoRange();
         updateArrangementSelector();
     }
+    /** Post-mutation housekeeping shared by exec/undo/redo (keys viewport sync). */
     _afterEdit() {
         // Keep the keys viewport in sync with the current note range so
         // multi-octave authoring works without manual range control.
@@ -950,6 +962,7 @@ class EditHistory {
         // extends it instead of collapsing to the latest note's octave.
         if (typeof isKeysMode === 'function' && isKeysMode()) updatePianoRange(true);
     }
+    /** Enable/disable the toolbar undo/redo buttons to match stack state. */
     _ui() {
         const u = document.getElementById('editor-undo');
         const r = document.getElementById('editor-redo');
@@ -1042,20 +1055,23 @@ class ChangeFretCmd {
     rollback() { notes()[this.index].fret = this.oldFret; }
 }
 
-// Wraps a global time transform (BPM rescale or offset nudge) as a single
-// undoable step. Snapshots every touched time field up front and restores
-// them exactly on rollback, rather than re-deriving an inverse factor/
-// offset — avoids compounding floating-point drift across repeated
-// undo/redo. `applyFn` performs the actual mutation (via
-// _scaleAllArrangementTimes plus the beats/sections loops the caller
-// already had) and may also update auxiliary UI state (e.g. the offset
-// input's cumulative dataset value) as part of the same atomic step.
+/**
+ * Wraps a global time transform (BPM rescale or offset nudge) as a single
+ * undoable step. Snapshots every touched time field up front and restores
+ * them exactly on rollback, rather than re-deriving an inverse factor/
+ * offset — avoids compounding floating-point drift across repeated
+ * undo/redo. `applyFn` performs the actual mutation (via
+ * _scaleAllArrangementTimes plus the beats/sections loops the caller
+ * already had) and may also update auxiliary UI state (e.g. the offset
+ * input's cumulative dataset value) as part of the same atomic step.
+ */
 class RescaleTimesCmd {
     constructor(applyFn) {
         this._applyFn = applyFn;
         this._before = RescaleTimesCmd._snapshot();
         this._after = null;
     }
+    /** Capture every time-bearing field this command can touch. */
     static _snapshot() {
         return {
             arrangements: S.arrangements.map(arr => ({
@@ -1072,6 +1088,7 @@ class RescaleTimesCmd {
                 : undefined,
         };
     }
+    /** Write a snapshot from _snapshot() back onto live state. */
     static _restore(snap) {
         S.arrangements.forEach((arr, ai) => {
             const as = snap.arrangements[ai];
@@ -1110,6 +1127,7 @@ class RescaleTimesCmd {
     }
 }
 
+/** Add a section marker (undoable). */
 class AddSectionCmd {
     constructor(section) { this.section = section; }
     exec() {
@@ -1122,6 +1140,7 @@ class AddSectionCmd {
     }
 }
 
+/** Rename a section marker (undoable). */
 class RenameSectionCmd {
     constructor(section, newName) {
         this.section = section;
@@ -1132,6 +1151,7 @@ class RenameSectionCmd {
     rollback() { this.section.name = this.oldName; }
 }
 
+/** Delete a section marker, restoring it at its original index on rollback. */
 class DeleteSectionCmd {
     constructor(section) {
         this.section = section;
@@ -1146,6 +1166,7 @@ class DeleteSectionCmd {
     }
 }
 
+/** Add a hit to the drum tab (undoable). */
 class AddDrumHitCmd {
     constructor(hit) { this.hit = hit; }
     exec() {
@@ -1163,6 +1184,7 @@ class AddDrumHitCmd {
     }
 }
 
+/** Delete a set of drum hits by index, restoring the full array on rollback. */
 class DeleteDrumHitsCmd {
     constructor(indices) {
         // Snapshot the full hits array — simplest correct restore given a
@@ -1184,6 +1206,7 @@ class DeleteDrumHitsCmd {
     }
 }
 
+/** Toggle ghost/flam/choke on a set of drum hits (undoable). */
 class ToggleDrumArticulationCmd {
     constructor(kind, indices) {
         this.field = kind === 'g' ? 'g' : kind === 'f' ? 'f' : 'k';
@@ -1218,9 +1241,11 @@ class ToggleDrumArticulationCmd {
     }
 }
 
-// Wraps a finished drum-hit drag (see _drumEditorOnDragEnd). `items` is
-// [{ref, origTime, origPiece}] — ref is the actual hit object, which stays
-// stable across the post-move re-sort's index remap (unlike an index).
+/**
+ * Wraps a finished drum-hit drag (see _drumEditorOnDragEnd). `items` is
+ * [{ref, origTime, origPiece}] — ref is the actual hit object, which stays
+ * stable across the post-move re-sort's index remap (unlike an index).
+ */
 class MoveDrumHitsCmd {
     constructor(items) {
         this.items = items.map(it => ({
@@ -1239,6 +1264,7 @@ class MoveDrumHitsCmd {
         for (const it of this.items) { it.ref.t = it.origTime; it.ref.p = it.origPiece; }
         this._resort();
     }
+    /** Re-sort drum hits by time and remap S.drumSel through the reorder. */
     _resort() {
         if (!S.drumTab || !Array.isArray(S.drumTab.hits)) return;
         const sentinel = Symbol('drumSel');
@@ -2016,9 +2042,15 @@ function onKeyDown(e) {
 // Context menu
 // ════════════════════════════════════════════════════════════════════
 
-// Clamp a popover's top-left so it stays fully on-screen. Must be called
-// after the element is unhidden (and has its final content), since it reads
-// offsetWidth/offsetHeight — a hidden (display:none) element measures 0.
+/**
+ * Clamp a popover's top-left so it stays fully on-screen. Must be called
+ * after the element is unhidden (and has its final content), since it reads
+ * offsetWidth/offsetHeight — a hidden (display:none) element measures 0.
+ * @param {HTMLElement} el - the popover element (already unhidden).
+ * @param {number} x - requested left, in page pixels.
+ * @param {number} y - requested top, in page pixels.
+ * @returns {{x: number, y: number}} the clamped position.
+ */
 function _clampPopoverPos(el, x, y) {
     const maxLeft = Math.max(0, window.innerWidth - el.offsetWidth);
     const maxTop = Math.max(0, window.innerHeight - el.offsetHeight);
@@ -2963,11 +2995,13 @@ window.editSong = (filename) => {
     loadCDLC(filename);
 };
 
-// Bound to the "Back" button (screen.html) instead of a bare
-// showScreen('home') so unsaved work (S.sessionDirty — see markSessionDirty)
-// isn't silently lost by a single misclick. The backend's own TTL sweep
-// (routes.py) still reclaims an abandoned session's temp dir independently
-// of whether the user confirms or cancels here.
+/**
+ * Bound to the "Back" button (screen.html) instead of a bare
+ * showScreen('home') so unsaved work (S.sessionDirty — see markSessionDirty)
+ * isn't silently lost by a single misclick. The backend's own TTL sweep
+ * (routes.py) still reclaims an abandoned session's temp dir independently
+ * of whether the user confirms or cancels here.
+ */
 window.editorGoBack = () => {
     if (sessionIsDirty() && !confirm('You have unsaved changes. Leave without saving?')) {
         return;
