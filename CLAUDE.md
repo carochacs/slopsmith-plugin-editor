@@ -16,3 +16,10 @@ See `specs/001-editor/tasks.md` for shipped/candidate work — all items tracked
 - All backend output via `context["log"]`, never `print()`.
 - New sibling modules must be loaded via `context["load_sibling"]`, not bare `import`.
 - UI changes that add Tailwind classes must be reflected in Slopsmith core's `scripts/build-tailwind.sh` (or the plugin must ship its own `assets/plugin.css` via the `styles` manifest key).
+
+## Working with CodeRabbit
+
+CodeRabbit reviews PRs on this repo automatically. `.coderabbit.yaml` tells it about the conventions above (`context["log"]`, `load_sibling`, minimal docstrings, the dual-path storage probe) so it doesn't re-flag deliberate decisions as findings — read that file before assuming a review comment is wrong. When working a PR here:
+- After pushing a fix, give CodeRabbit a pass (`@coderabbitai review` if it doesn't auto-trigger) and treat its comments like any other reviewer's — fix or reply with a reason, don't silently ignore.
+- Resolve review threads as fixes land so the PR reflects live state.
+- Don't let CodeRabbit approval substitute for a human merge decision.
