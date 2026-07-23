@@ -29,8 +29,6 @@
         <button id="editor-add-guitar-btn" onclick="editorShowAddGuitarModal()" class="px-3 py-1 bg-green-900 hover:bg-green-800 rounded text-xs font-medium hidden">+ Guitar</button>
         <button id="editor-gen-diff-btn" onclick="editorGenerateDifficulties()" class="px-3 py-1 bg-teal-900 hover:bg-teal-800 rounded text-xs font-medium hidden" title="Generate multi-difficulty phrase ladders from note scoring">&#x27F3; Difficulties</button>
         <span id="editor-key-badge" class="text-xs text-teal-400 font-mono hidden"></span>
-        <button id="editor-chords-btn" onclick="editorToggleChords()" class="px-2 py-0.5 bg-dark-600 hover:bg-dark-500 rounded text-xs hidden" title="Toggle detected chord-name labels on the timeline">Chords</button>
-        <button id="editor-lyrics-btn" onclick="editorToggleLyrics()" class="px-2 py-0.5 bg-dark-600 hover:bg-dark-500 rounded text-xs hidden" title="Toggle karaoke lyrics on the timeline">Lyrics</button>
         <button id="editor-strings-btn" onclick="editorShowStringsModal()" class="px-3 py-1 bg-amber-800 hover:bg-amber-700 rounded text-xs font-medium hidden" title="Add or remove strings on the active arrangement (extended-range guitar / bass)">⋮ Strings</button>
         <button id="editor-record-midi-btn" onclick="editorShowRecordMidiModal()" class="px-3 py-1 bg-rose-900 hover:bg-rose-800 rounded text-xs font-medium hidden disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-rose-900" title="Record a Keys arrangement live from a MIDI keyboard (Chrome/Edge)">● Record</button>
 
@@ -77,14 +75,8 @@
         <button onclick="editorNudgeOffset(-0.01)" class="px-1 py-0.5 bg-dark-600 hover:bg-dark-500 rounded text-xs" title="-10ms">&lt;</button>
         <input type="number" id="editor-offset" step="0.01" value="0"
             class="w-16 bg-dark-700 border border-gray-700 rounded px-1 py-0.5 text-xs text-gray-300 outline-none text-center"
-            onchange="editorApplyOffset(this.value)" title="Shift notes by seconds (negative = earlier) — scope set by the dropdown to the right">
+            onchange="editorApplyOffset(this.value)" title="Shift all notes by seconds (negative = earlier)">
         <button onclick="editorNudgeOffset(0.01)" class="px-1 py-0.5 bg-dark-600 hover:bg-dark-500 rounded text-xs" title="+10ms">&gt;</button>
-        <select id="editor-offset-scope" onchange="editorOffsetScopeChanged()"
-            class="bg-dark-700 border border-gray-700 rounded px-1 py-0.5 text-xs text-gray-300 outline-none"
-            title="Which arrangement(s) the Offset controls affect">
-            <option value="current" selected>This arr</option>
-            <option value="all">All arrs</option>
-        </select>
 
         <div class="h-4 w-px bg-gray-700"></div>
 
@@ -108,7 +100,6 @@
     <!-- Status bar -->
     <div class="flex items-center gap-4 px-4 py-1 bg-dark-800 border-t border-gray-800 shrink-0">
         <span id="editor-status" class="text-xs text-gray-500">Ready</span>
-        <span id="editor-lyric-now" class="text-xs text-gray-300"></span>
         <div class="flex-1"></div>
         <span id="editor-note-count" class="text-xs text-gray-600"></span>
         <span class="text-xs text-gray-600">Scroll: zoom | Middle-drag: pan | Dbl-click: add note | Del: delete</span>
@@ -316,18 +307,9 @@
                 oninput="editorSyncUpdateFactor()">
         </div>
         <div>
-            <label class="text-gray-500">Time offset (seconds): <span id="sync-offset-tag" class="text-gray-600"></span></label>
+            <label class="text-gray-500">Time offset (seconds):</label>
             <input type="number" id="sync-offset" step="0.01" value="0" placeholder="0"
-                class="w-full bg-dark-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 outline-none mt-1"
-                oninput="editorSyncOffsetEdited()">
-        </div>
-        <div>
-            <label class="text-gray-500">Apply to:</label>
-            <select id="sync-scope"
                 class="w-full bg-dark-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 outline-none mt-1">
-                <option value="current" selected>This arrangement</option>
-                <option value="all">All arrangements</option>
-            </select>
         </div>
     </div>
     <div class="flex gap-2 mt-3">
