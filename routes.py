@@ -464,19 +464,67 @@ def setup(app, context):
                     return None
                 return candidate if candidate.exists() else None
 
+            # Same basename-collision class as session_id: nested paths like
+            # `foo/bar.psarc` and `baz/bar.sloppak` both reduce to stem "bar".
+            # Use a sanitised full path so two browser tabs loading distinct
+            # songs don't overwrite each other's `editor_audio_*` file.
+            audio_id = filename.replace("/", "__").replace("\\", "__").replace(" ", "_")
+
+            def _mix_stems_to_full(stems):
+                """Mix every available stem into one full-song ogg so the
+                editor plays the whole song, not one isolated instrument.
+
+                TabGrabber sloppaks ship only Demucs stems (no ``full`` mix),
+                so without this the editor would load the first stem (e.g. an
+                isolated guitar). Demucs stems are an additive decomposition,
+                so ``amix ... normalize=0`` reconstructs ~the original mix
+                without a 1/N attenuation or clipping. Returns the mixed Path,
+                or None when ffmpeg is unavailable / fails (caller then falls
+                back to a single stem). Runs inside the load executor, so the
+                blocking ffmpeg call is off the event loop.
+                """
+                paths = []
+                for s in stems:
+                    p = _safe_stem_path(s)
+                    if p is not None and p.exists():
+                        paths.append(p)
+                if len(paths) < 2:
+                    return None
+                mix_dest = STORAGE_DIR / f"editor_audio_{audio_id}_mix.ogg"
+                if mix_dest.exists():
+                    return mix_dest  # reuse a prior mix for the same song
+                cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+                for p in paths:
+                    cmd += ["-i", str(p)]
+                cmd += ["-filter_complex", f"amix=inputs={len(paths)}:normalize=0",
+                        "-c:a", "libvorbis", "-q:a", "5", str(mix_dest)]
+                try:
+                    subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+                except (OSError, subprocess.SubprocessError) as e:
+                    log.warning("[Editor] stem mix failed (%s); using a single stem", e)
+                    mix_dest.unlink(missing_ok=True)
+                    return None
+                return mix_dest if mix_dest.exists() else None
+
+            # Prefer an explicit "full" mix stem.
             for s in loaded.stems:
                 if s.get("id") == "full":
                     stem_path = _safe_stem_path(s)
                     break
-            if stem_path is None and loaded.stems:
+            # No "full" stem but several isolated stems -> mix them so the
+            # editor's waveform/playback is the whole song.
+            mixed_path = None
+            if stem_path is None and len(loaded.stems) > 1:
+                mixed_path = _mix_stems_to_full(loaded.stems)
+            # Last resort: the first stem (single-stem sloppak, or ffmpeg
+            # unavailable).
+            if stem_path is None and mixed_path is None and loaded.stems:
                 stem_path = _safe_stem_path(loaded.stems[0])
-            if stem_path and stem_path.exists():
-                # Same basename-collision class as session_id: nested paths
-                # like `foo/bar.psarc` and `baz/bar.sloppak` both reduce
-                # to stem "bar". Use a sanitised full path so two browser
-                # tabs loading distinct songs don't overwrite each other's
-                # `editor_audio_*` file under STATIC_DIR.
-                audio_id = filename.replace("/", "__").replace("\\", "__").replace(" ", "_")
+
+            if mixed_path is not None and mixed_path.exists():
+                audio_url = f"{STORAGE_URL}/{mixed_path.name}"
+                audio_file = str(mixed_path)
+            elif stem_path and stem_path.exists():
                 ext = stem_path.suffix
                 dest = STORAGE_DIR / f"editor_audio_{audio_id}{ext}"
                 shutil.copy2(stem_path, dest)
