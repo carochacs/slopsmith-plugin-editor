@@ -22,7 +22,11 @@ jobs:
       - name: Install test dependencies
         # numpy + librosa back the chroma/DTW sync-offset tests
         # (tests/test_sync_offset.py); librosa pulls in numpy/scipy/numba.
-        run: pip install pytest numpy librosa
+        # `-c requirements.txt` single-sources the librosa version bound
+        # from the declared requirements so CI can't drift from them, while
+        # skipping the heavy runtime-only deps there (basic-pitch/tensorflow,
+        # yt-dlp) that the tests don't need.
+        run: pip install pytest numpy librosa -c requirements.txt
       - name: Run Python tests
         run: python -m pytest tests/ -v
 
