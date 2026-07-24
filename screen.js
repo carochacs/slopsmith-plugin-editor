@@ -79,6 +79,27 @@ const S = {
     currentArr: 0,
     beats: [], sections: [], duration: 0, offset: 0,
 
+    // Single source of truth for the offset/sync SCOPE ('current' | 'all'),
+    // shared by the toolbar picker and the Sync dialog picker so the two
+    // can't disagree, and persisting across dialog opens (issue #16 — the
+    // old design had two independent, unlinked selects that reset every
+    // open). setOffsetScope() keeps both <select>s mirrored to this.
+    offsetScope: 'current',
+
+    // Karaoke lyrics — flat word list [{t, d, w}], only present on sloppak
+    // sessions whose manifest already references a lyrics.json (e.g. one
+    // produced by TabGrabber). Empty for every other session.
+    lyrics: [],
+    lyricSel: -1, // index into S.lyrics of the selected word, or -1
+    lyricsDirty: false, // true once the user edits/deletes a word this session
+    showLyrics: true,
+    showChords: true,
+
+    // Chord/key analysis for the active arrangement, from analyze-chords.
+    // Recomputed on load and on arrangement switch, not on every edit.
+    songKey: '',
+    chordLabels: [], // [{time, name}]
+
     // Drum tab — null until the user adds drums via the +Drums modal, then
     // a dict matching docs/sloppak-spec.md §5.3 ({version,name,kit,hits}).
     // Persisted via _buildSaveBody as the `drum_tab` field on the save body.
@@ -143,6 +164,10 @@ function sessionIsDirty() { return !!S.sessionDirty; }
 
 let canvas, ctx;
 let rafId = null;
+
+// Rendered lyric-word hitboxes from the last drawLyrics() pass, used for
+// click/dblclick hit-testing — [{x, w, idx}], index into S.lyrics.
+let _lyricHitboxes = [];
 
 // ════════════════════════════════════════════════════════════════════
 // Coordinate mapping
@@ -378,15 +403,18 @@ function flattenChords() {
     arr.notes.sort((a, b) => a.time - b.time);
 }
 
-// Rescale note/chord times across every arrangement in the song (not just
-// S.currentArr). S.beats/S.sections are song-wide — every arrangement was
-// authored against that same shared grid — so a tempo/offset correction
-// must move every arrangement's notes together or the ones the user isn't
-// currently viewing end up desynced from the (now-corrected) beat grid,
-// with no way to recover the right factor afterward (getTabBPM() would
-// just read back the already-corrected grid).
-function _scaleAllArrangementTimes(factor, offset) {
-    for (const arr of S.arrangements) {
+// Rescale note/chord times across the given arrangements — defaults to
+// every arrangement in the song. Callers that scale ALL arrangements
+// together must also scale S.beats/S.sections (song-wide — every
+// arrangement was authored against that same shared grid), or the ones
+// the user isn't currently viewing end up desynced from the now-corrected
+// beat grid, with no way to recover the right factor afterward
+// (getTabBPM() would just read back the already-corrected grid). Callers
+// scaling a single arrangement must leave S.beats/S.sections alone —
+// shifting the shared grid for a one-arrangement correction would
+// silently desync every OTHER arrangement against it instead.
+function _scaleAllArrangementTimes(factor, offset, arrangements) {
+    for (const arr of (arrangements || S.arrangements)) {
         for (const n of arr.notes) {
             n.time = n.time / factor + offset;
             if (n.sustain) n.sustain = n.sustain / factor;
@@ -505,9 +533,11 @@ function draw() {
     _laneLabelsCacheValue = laneLabels();
     try {
         drawWaveform(w);
+        drawLyrics(w);
         drawLanes(w);
         drawGrid(w);
         drawSections(w);
+        drawChordLabels(w);
         drawBeatBar(w);
         drawNotes(w);
         drawSelectionRect(w);
@@ -621,6 +651,56 @@ function drawSections(w) {
         ctx.fillStyle = '#e8c040';
         ctx.textAlign = 'left';
         ctx.fillText(s.name, x + 3, WAVEFORM_H + 2);
+    }
+}
+
+// Chord names detected by analyze-chords, drawn just below the section
+// labels so the two rows don't overlap.
+function drawChordLabels(w) {
+    if (!S.showChords || !S.chordLabels.length) return;
+    const st = S.scrollX - 1;
+    const et = S.scrollX + (w - LABEL_W) / S.zoom + 1;
+    ctx.font = '9px monospace';
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#5ec8e8';
+    for (const c of S.chordLabels) {
+        if (c.time < st || c.time > et) continue;
+        const x = timeToX(c.time);
+        if (x < LABEL_W || x > w) continue;
+        ctx.fillText(c.name, x + 3, WAVEFORM_H + 11);
+    }
+}
+
+// Karaoke lyric words, drawn as a thin strip inside the waveform area.
+// Rebuilds _lyricHitboxes every call so onMouseDown/onDblClick hit-test
+// against what's actually on screen right now.
+function drawLyrics(w) {
+    _lyricHitboxes = [];
+    if (!S.showLyrics || !S.lyrics.length) return;
+    const st = S.scrollX - 1;
+    const et = S.scrollX + (w - LABEL_W) / S.zoom + 1;
+    const y = Math.max(2, WAVEFORM_H - 12);
+    ctx.font = '9px monospace';
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+    for (let i = 0; i < S.lyrics.length; i++) {
+        const word = S.lyrics[i];
+        const t = word.t || 0;
+        if (t < st || t > et) continue;
+        const x = timeToX(t);
+        if (x < LABEL_W || x > w) continue;
+        const selected = i === S.lyricSel;
+        const text = word.w || '';
+        ctx.fillStyle = selected ? '#ffffff' : '#c060e8';
+        ctx.fillText(text, x + 1, y);
+        const tw = Math.max(ctx.measureText(text).width, 6);
+        _lyricHitboxes.push({ x, w: tw, idx: i });
+        ctx.strokeStyle = selected ? '#ffffff80' : '#c060e860';
+        ctx.beginPath();
+        ctx.moveTo(x, y + 10);
+        ctx.lineTo(x, y + 14);
+        ctx.stroke();
     }
 }
 
@@ -1086,6 +1166,13 @@ class RescaleTimesCmd {
             offsetApplied: (document.getElementById('editor-offset') || {}).dataset
                 ? document.getElementById('editor-offset').dataset.applied
                 : undefined,
+            // editorApplyOffset also records which scope ('current' vs
+            // 'all') the applied delta covered — undo/redo has to restore
+            // that alongside the value itself, or _effectiveAudioOffset()
+            // would read the wrong scope after a rollback.
+            offsetAppliedScope: (document.getElementById('editor-offset') || {}).dataset
+                ? document.getElementById('editor-offset').dataset.appliedScope
+                : undefined,
         };
     }
     /** Write a snapshot from _snapshot() back onto live state. */
@@ -1113,6 +1200,7 @@ class RescaleTimesCmd {
         S.sections.forEach((s, i) => { if (snap.sections[i] !== undefined) s.start_time = snap.sections[i]; });
         const offsetEl = document.getElementById('editor-offset');
         if (offsetEl && snap.offsetApplied !== undefined) offsetEl.dataset.applied = snap.offsetApplied;
+        if (offsetEl && snap.offsetAppliedScope !== undefined) offsetEl.dataset.appliedScope = snap.offsetAppliedScope;
     }
     exec() {
         if (this._after) {
@@ -1529,12 +1617,27 @@ function onMouseDown(e) {
 
     // Left button
     if (y < WAVEFORM_H) {
+        // Lyric word click takes priority over waveform-seek, but only
+        // inside the thin strip drawLyrics() actually rendered into —
+        // everywhere else in the waveform still just moves the cursor.
+        if (S.showLyrics && S.lyrics.length) {
+            const lyricY = Math.max(2, WAVEFORM_H - 12);
+            if (y >= lyricY - 2 && y <= lyricY + 14) {
+                const hit = _lyricHitboxes.find(h => x >= h.x - 2 && x <= h.x + h.w + 2);
+                if (hit) {
+                    S.lyricSel = hit.idx;
+                    draw();
+                    return;
+                }
+            }
+        }
         // Block waveform seek while recording: restarting the AudioBufferSourceNode
         // would fire onended and prematurely finalize the take.
         if (_recState === 'recording') return;
         // Click on waveform = set cursor
         S.cursorTime = Math.max(0, xToTime(x));
         if (S.playing) { stopPlayback(); startPlayback(); }
+        updateLyricNow();
         draw();
         return;
     }
@@ -1797,6 +1900,20 @@ function onDblClick(e) {
     if (S.drumEditMode) return;  // drum-edit mode handles all canvas interaction
     if (_recState === 'recording') return;  // block note addition during active take
     const { x, y } = getMousePos(e);
+
+    // Double-click a lyric word to edit its text/timing (prompt-based,
+    // matching showSectionMenu's rename UX rather than a bespoke modal).
+    if (S.showLyrics && S.lyrics.length) {
+        const lyricY = Math.max(2, WAVEFORM_H - 12);
+        if (y >= lyricY - 2 && y <= lyricY + 14) {
+            const hit = _lyricHitboxes.find(h => x >= h.x - 2 && x <= h.x + h.w + 2);
+            if (hit) {
+                editLyricWord(hit.idx);
+                return;
+            }
+        }
+    }
+
     const keysMode = isKeysMode();
     const laneBottom = keysMode
         ? WAVEFORM_H + pianoLaneCount() * PIANO_LANE_H
@@ -1816,6 +1933,43 @@ function onDblClick(e) {
         showAddNote(e.clientX, e.clientY, t, s);
     }
 }
+
+// Edit a lyric word's text/timing in place. Matches showSectionMenu's
+// prompt()-based rename rather than a bespoke modal — lyric editing is a
+// light touch-up of TabGrabber-produced text, not full authoring.
+function editLyricWord(idx) {
+    const word = S.lyrics[idx];
+    if (!word) return;
+    const newText = prompt('Word:', word.w || '');
+    if (newText === null) return;
+    const newTimeStr = prompt('Start time (seconds):', (word.t || 0).toFixed(3));
+    if (newTimeStr === null) return;
+    const newTime = parseFloat(newTimeStr);
+    if (!isFinite(newTime) || newTime < 0) return;
+    word.w = newText;
+    word.t = newTime;
+    S.lyrics.sort((a, b) => (a.t || 0) - (b.t || 0));
+    S.lyricSel = S.lyrics.indexOf(word);
+    S.lyricsDirty = true;
+    markSessionDirty();
+    draw();
+    setStatus('Lyric updated');
+}
+
+window.editorToggleLyrics = () => {
+    S.showLyrics = !S.showLyrics;
+    // opacity-50 (already used elsewhere for a dimmed/inactive look) marks
+    // the toggle as off, rather than introducing a new Tailwind utility
+    // class that isn't already compiled into Slopsmith core's CSS bundle.
+    document.getElementById('editor-lyrics-btn').classList.toggle('opacity-50', !S.showLyrics);
+    draw();
+};
+
+window.editorToggleChords = () => {
+    S.showChords = !S.showChords;
+    document.getElementById('editor-chords-btn').classList.toggle('opacity-50', !S.showChords);
+    draw();
+};
 
 function onWheel(e) {
     e.preventDefault();
@@ -1861,6 +2015,13 @@ function onContextMenu(e) {
     showContextMenu(e.clientX, e.clientY, idx);
 }
 
+// Common structural labels, matching TabGrabber's section vocabulary
+// (Intro/Verse/Chorus/Bridge/Outro/Interlude). One-click for the common
+// case; "Custom…" falls back to the original freeform prompt() so nothing
+// is lost — sections still store a plain `name` string, no data-model
+// change.
+const SECTION_TYPES = ['Intro', 'Verse', 'Chorus', 'Bridge', 'Outro', 'Interlude', 'Solo', 'Breakdown'];
+
 function showSectionMenu(cx, cy, time) {
     const menu = document.getElementById('editor-context-menu');
     // Check if clicking near an existing section
@@ -1868,6 +2029,40 @@ function showSectionMenu(cx, cy, time) {
     for (const s of S.sections) {
         if (Math.abs(s.start_time - time) < 1.0) { nearSection = s; break; }
     }
+
+    const applyAdd = (name) => {
+        if (!name) return;
+        const num = S.sections.filter(s => s.name === name).length + 1;
+        S.history.exec(new AddSectionCmd({ name, number: num, start_time: snapTime(time) }));
+        draw();
+    };
+    const applyRename = (name) => {
+        if (!name || !nearSection) return;
+        S.history.exec(new RenameSectionCmd(nearSection, name));
+        draw();
+    };
+
+    // Swaps the menu's contents in place to a type picker — the menu stays
+    // open, it doesn't reopen at a new position — then calls onPick(name)
+    // once the user chooses a label (or types a custom one).
+    const renderTypeSubmenu = (defaultName, onPick) => {
+        let subHtml = '';
+        for (const t of SECTION_TYPES) {
+            subHtml += `<button class="w-full text-left px-3 py-1 text-xs hover:bg-dark-500" data-type="${t}">${t}</button>`;
+        }
+        subHtml += `<button class="w-full text-left px-3 py-1 text-xs hover:bg-dark-500 text-gray-400" data-type="__custom">Custom…</button>`;
+        menu.innerHTML = subHtml;
+        menu.querySelectorAll('[data-type]').forEach(btn => {
+            btn.onclick = () => {
+                hideContextMenu();
+                if (btn.dataset.type === '__custom') {
+                    onPick(prompt('Section name:', defaultName));
+                } else {
+                    onPick(btn.dataset.type);
+                }
+            };
+        });
+    };
 
     let html = '';
     html += `<button class="w-full text-left px-3 py-1 text-xs hover:bg-dark-500" data-action="add">Add Section Here</button>`;
@@ -1878,17 +2073,12 @@ function showSectionMenu(cx, cy, time) {
     menu.innerHTML = html;
     menu.querySelectorAll('[data-action]').forEach(btn => {
         btn.onclick = () => {
-            hideContextMenu();
             if (btn.dataset.action === 'add') {
-                const name = prompt('Section name:', 'verse');
-                if (!name) return;
-                const num = S.sections.filter(s => s.name === name).length + 1;
-                S.history.exec(new AddSectionCmd({ name, number: num, start_time: snapTime(time) }));
-                draw();
+                renderTypeSubmenu('Verse', applyAdd);
             } else if (btn.dataset.action === 'rename' && nearSection) {
-                const name = prompt('New name:', nearSection.name);
-                if (name) { S.history.exec(new RenameSectionCmd(nearSection, name)); draw(); }
+                renderTypeSubmenu(nearSection.name, applyRename);
             } else if (btn.dataset.action === 'delete' && nearSection) {
+                hideContextMenu();
                 S.history.exec(new DeleteSectionCmd(nearSection));
                 draw();
             }
@@ -1917,6 +2107,19 @@ function onKeyDown(e) {
     if (_recState === 'recording') return;
 
     if (e.key === 'Delete' || e.key === 'Backspace') {
+        // Selected lyric word: remove it. Kept separate from S.sel (guitar/
+        // keys note selection) so this can't fire alongside — or instead
+        // of — a note deletion the user actually intended.
+        if (S.lyricSel >= 0 && S.lyricSel < S.lyrics.length &&
+                !e.target.matches('input, select, textarea')) {
+            e.preventDefault();
+            S.lyrics.splice(S.lyricSel, 1);
+            S.lyricSel = -1;
+            S.lyricsDirty = true;
+            markSessionDirty();
+            draw();
+            return;
+        }
         // Drum-edit mode: delete selected drum hits (undoable via
         // DeleteDrumHitsCmd, same as the guitar/keys delete path below).
         // Guard against focus being inside a form control (mirrors the note-
@@ -2317,8 +2520,33 @@ function playbackTick() {
     }
 
     updateTimeDisplay();
+    updateLyricNow();
     draw();
     rafId = requestAnimationFrame(playbackTick);
+}
+
+// Cache of the last-resolved lyric index so updateLyricNow() can walk
+// forward/backward from there instead of rescanning S.lyrics every frame —
+// cursor time moves monotonically during normal playback, so this is
+// amortized O(1) rather than O(n) per animation frame.
+let _lyricNowIdx = -1;
+
+function updateLyricNow() {
+    const el = document.getElementById('editor-lyric-now');
+    if (!el) return;
+    if (!S.lyrics.length) {
+        if (el.textContent) el.textContent = '';
+        _lyricNowIdx = -1;
+        return;
+    }
+    const t = S.cursorTime;
+    let i = _lyricNowIdx < 0 ? 0 : Math.min(_lyricNowIdx, S.lyrics.length - 1);
+    while (i > 0 && (S.lyrics[i].t || 0) > t) i--;
+    while (i < S.lyrics.length - 1 && (S.lyrics[i + 1].t || 0) <= t) i++;
+    _lyricNowIdx = i;
+    const w = S.lyrics[i];
+    const active = t >= (w.t || 0) && t < (w.t || 0) + (w.d || 0);
+    el.textContent = active ? (w.w || '') : '';
 }
 
 function updatePlayIcon() {
@@ -2376,6 +2604,12 @@ async function loadCDLC(filename) {
         S.sections = data.sections || [];
         S.duration = data.duration || 0;
         S.offset = data.offset || 0;
+        // Karaoke lyrics, only present when the sloppak's manifest already
+        // references a lyrics.json (e.g. one produced by TabGrabber).
+        S.lyrics = data.lyrics || [];
+        S.lyricSel = -1;
+        S.lyricsDirty = false;
+        _lyricNowIdx = -1;
         // Drum tab is loaded server-side when the manifest carries a
         // `drum_tab:` key and the file passes schema validation. Treat
         // a missing/falsey value as "no drums" so the +Drums modal can
@@ -2398,8 +2632,9 @@ async function loadCDLC(filename) {
         S.cursorTime = 0;
         S.history = new EditHistory();
 
-        // Reset offset UI so _effectiveAudioOffset() doesn't carry over a
-        // delta from a previous session's sync nudge into this one.
+        // Reset offset UI + scope so neither _effectiveAudioOffset() nor the
+        // shared scope carry over from a previous session's sync nudge.
+        setOffsetScope('current');
         _resetOffsetUI();
 
         // Flatten chord notes into main notes array for unified editing
@@ -2416,6 +2651,7 @@ async function loadCDLC(filename) {
         document.getElementById('editor-play-btn').disabled = !data.audio_url;
         document.getElementById('editor-sync-btn').classList.toggle('hidden', !data.audio_url);
         document.getElementById('editor-replace-audio-btn').classList.remove('hidden');
+        document.getElementById('editor-lyrics-btn').classList.toggle('hidden', !S.lyrics.length);
         updateArrangementSelector();
         updateStatus();
         updateTimeDisplay();
@@ -2428,6 +2664,7 @@ async function loadCDLC(filename) {
 
         draw();
         setStatus('Loaded: ' + S.artist + ' — ' + S.title);
+        refreshChordAnalysis(); // not awaited — fills in key/chords once the request lands
     } catch (e) {
         setStatus('Load failed: ' + e.message);
     }
@@ -2572,12 +2809,32 @@ function _editorEscHtml(s) {
         .replace(/'/g, '&#39;');
 }
 
-// Reset the offset input and its applied-delta dataset, called when loading
-// any session so _effectiveAudioOffset() doesn't carry over a previous nudge.
+// Reset the offset input and its applied-delta dataset — called when
+// loading any session (so _effectiveAudioOffset() doesn't carry over a
+// previous nudge) and when the scope/arrangement it applies to changes
+// (so a stale baseline from a different scope or arrangement doesn't
+// compute a bogus delta on the next nudge).
 function _resetOffsetUI() {
     const el = document.getElementById('editor-offset');
-    if (el) { el.value = '0'; el.dataset.applied = '0'; }
+    if (el) { el.value = '0'; el.dataset.applied = '0'; el.dataset.appliedScope = ''; }
 }
+
+// The one place the offset/sync scope is set. Writes S.offsetScope and
+// mirrors it onto BOTH the toolbar picker and the Sync dialog picker so
+// the two controls always agree (issue #16). Changing the scope resets the
+// offset baseline, since a "this arrangement" delta and an "all
+// arrangements" delta aren't interchangeable.
+function setOffsetScope(scope) {
+    const next = scope === 'all' ? 'all' : 'current';
+    const changed = next !== S.offsetScope;
+    S.offsetScope = next;
+    const toolbarEl = document.getElementById('editor-offset-scope');
+    if (toolbarEl && toolbarEl.value !== next) toolbarEl.value = next;
+    const dialogEl = document.getElementById('sync-scope');
+    if (dialogEl && dialogEl.value !== next) dialogEl.value = next;
+    if (changed) _resetOffsetUI();
+}
+function getOffsetScope() { return S.offsetScope === 'all' ? 'all' : 'current'; }
 
 function _normalizeSongList(raw) {
     // Backend now returns [{filename, format}] objects. Older deployments
@@ -2710,6 +2967,13 @@ function _buildSaveBody(forceFullSnapshot) {
     // hit list on every unrelated save.
     if (S.drumTabDirty && S.drumTab !== undefined && S.drumTab !== null) {
         body.drum_tab = S.drumTab;
+    }
+    // Lyrics — sloppak-only (backend rejects it otherwise), and only
+    // shipped once the user actually edits a word this session. A tab
+    // merely loaded from disk is left out, mirroring drum_tab above, so
+    // an unrelated save can't accidentally rewrite lyrics.json.
+    if (S.format === 'sloppak' && S.lyricsDirty) {
+        body.lyrics = S.lyrics;
     }
     return body;
 }
@@ -2935,28 +3199,60 @@ window.editorSetBPM = (val) => {
 };
 window.editorApplyOffset = (val) => {
     const offset = parseFloat(val) || 0;
-    const currentOffset = parseFloat(document.getElementById('editor-offset').dataset.applied || '0');
+    const el = document.getElementById('editor-offset');
+    const currentOffset = parseFloat(el.dataset.applied || '0');
     const delta = offset - currentOffset;
     if (Math.abs(delta) < 0.0001) return;
+
+    const scopeAll = getOffsetScope() === 'all';
+    const targetArrangements = scopeAll ? S.arrangements : [S.arrangements[S.currentArr]];
     S.history.exec(new RescaleTimesCmd(() => {
-        _scaleAllArrangementTimes(1, delta);
-        for (const b of S.beats) b.time += delta;
-        for (const s of S.sections) s.start_time += delta;
-        document.getElementById('editor-offset').dataset.applied = String(offset);
+        _scaleAllArrangementTimes(1, delta, targetArrangements);
+        // The shared beat/section grid only moves for an all-arrangements
+        // nudge — see _scaleAllArrangementTimes' comment.
+        if (scopeAll) {
+            for (const b of S.beats) b.time += delta;
+            for (const s of S.sections) s.start_time += delta;
+        }
+        el.dataset.applied = String(offset);
+        el.dataset.appliedScope = scopeAll ? 'all' : 'current';
     }));
     draw();
-    setStatus(`Offset: ${offset >= 0 ? '+' : ''}${(offset * 1000).toFixed(0)}ms`);
+    setStatus(
+        `Offset (${scopeAll ? 'all arrangements' : 'this arrangement'}): ` +
+        `${offset >= 0 ? '+' : ''}${(offset * 1000).toFixed(0)}ms`
+    );
+};
+
+window.editorOffsetScopeChanged = () => {
+    // Toolbar picker changed → update the shared scope (which also mirrors
+    // the dialog picker and resets the nudge baseline, since a "this
+    // arrangement" nudge and an "all arrangements" nudge aren't the same
+    // delta).
+    setOffsetScope(document.getElementById('editor-offset-scope').value);
+};
+
+window.editorSyncScopeChanged = () => {
+    // Dialog picker changed → same shared scope, so the toolbar stays in
+    // lock-step and the choice persists after the dialog closes.
+    setOffsetScope(document.getElementById('sync-scope').value);
 };
 
 // Effective audio offset to send when importing a new arrangement: the
-// song's loaded offset plus any UI-applied shift the user already made
-// via editorApplyOffset (which moves notes/beats but never updates
-// S.offset). Without this, a +Keys/+Drums import after a sync nudge
-// lands out of phase with the chart the user just realigned.
+// song's loaded offset plus any song-wide UI-applied shift the user
+// already made via editorApplyOffset. Only an "all arrangements" nudge
+// counts here — that's the only kind that actually moved the shared beat
+// grid audio aligns against; a single-arrangement nudge shifted just that
+// one arrangement's own notes and shouldn't leak into a brand-new
+// arrangement's import alignment. Without this, a +Keys/+Drums import
+// after a song-wide sync nudge would land out of phase with the chart the
+// user just realigned.
 function _effectiveAudioOffset() {
     const base = Number(S.offset) || 0;
     const el = document.getElementById('editor-offset');
-    const applied = el ? parseFloat(el.dataset.applied || '0') || 0 : 0;
+    const applied = (el && el.dataset.appliedScope === 'all')
+        ? (parseFloat(el.dataset.applied || '0') || 0)
+        : 0;
     return base + applied;
 }
 window.editorNudgeOffset = (delta) => {
@@ -2978,8 +3274,14 @@ window.editorSelectArrangement = (val) => {
     S.sel.clear();
     flattenChords();
     if (isKeysMode()) updatePianoRange();
+    // A "this arrangement" offset baseline refers to the arrangement we're
+    // leaving, not the new one — reset it so the next nudge computes its
+    // delta from zero. An "all arrangements" baseline stays valid (it's
+    // song-wide, not tied to S.currentArr).
+    if (getOffsetScope() !== 'all') _resetOffsetUI();
     draw();
     updateStatus();
+    refreshChordAnalysis(); // key/chords are per-arrangement — not awaited
 };
 window.editorToggleTech = (idx, tech) => {
     const n = notes()[idx];
@@ -3015,8 +3317,11 @@ window.editorGoBack = () => {
 
 let syncState = { tabBPM: 0, audioBPM: 0 };
 
-function detectAudioBPM() {
-    if (!S.audioBuffer) return 0;
+// Spectral-flux onset envelope used by the client-side BPM estimate
+// (autocorrelation, below) shown instantly while the server's chroma/DTW
+// detection runs. Returns null when there's no audio loaded.
+function computeOnsetEnvelope() {
+    if (!S.audioBuffer) return null;
     const data = S.audioBuffer.getChannelData(0);
     const sr = S.audioBuffer.sampleRate;
 
@@ -3045,6 +3350,14 @@ function detectAudioBPM() {
         localAvg /= avgWin;
         onset[i] = Math.max(0, diff - localAvg * 1.2);
     }
+
+    return { onset, hopSize, sr };
+}
+
+function detectAudioBPM() {
+    const env = computeOnsetEnvelope();
+    if (!env) return 0;
+    const { onset, hopSize, sr } = env;
 
     // Autocorrelation for BPM range 60-220
     const frameDur = hopSize / sr;
@@ -3134,21 +3447,143 @@ function getTabBPM() {
     return 60 / avg;
 }
 
+// Confidence below this is treated as a (verifiable) mismatch: the Apply
+// button then requires an explicit confirmation, and the badge switches to
+// its "verify this" styling. Chosen to match the low end of the server's
+// continuous [0,1] chroma/DTW score (issue #16 data-safety item).
+const SYNC_CONFIDENCE_MIN = 0.45;
+
+// Latest server detection for the open Sync dialog. `confidence` is the
+// continuous [0,1] chroma/DTW score; `unverifiable` marks cases where a
+// pitch check can't be run at all (no notes, no audio, drum arrangement)
+// — distinct from a real "the audio doesn't match" mismatch.
+let syncDetect = { confidence: null, unverifiable: false, reason: '', pending: false };
+let _syncDetectSeq = 0;      // guards against out-of-order async responses
+let _syncManualBpmTimer = null;
+
+// Ask the server (chroma + DTW, librosa) for BPM and a tempo-corrected
+// offset suggestion. Read-only on the server — no session/disk writes.
+// Not awaited by callers: the dialog is usable immediately and fills in
+// when the result lands. Superseded requests (arrangement switch, manual
+// BPM edit) are dropped via the sequence guard.
+async function detectSyncFromServer() {
+    if (!S.sessionId || !S.arrangements.length) return;
+    const arr = S.arrangements[S.currentArr];
+    const manualBpm = parseFloat(document.getElementById('sync-manual-bpm').value);
+    const seq = ++_syncDetectSeq;
+    syncDetect = { confidence: null, unverifiable: false, reason: '', pending: true };
+    _renderSyncConfidence();
+    try {
+        const resp = await fetch('/api/plugins/editor/detect-sync-offset', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                session_id: S.sessionId,
+                tab_bpm: syncState.tabBPM,
+                manual_bpm: manualBpm > 0 ? manualBpm : undefined,
+                arrangement: {
+                    name: arr.name,
+                    tuning: arr.tuning,
+                    notes: notes(),
+                },
+            }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (seq !== _syncDetectSeq) return; // a newer request already fired
+        if (!resp.ok || data.error) {
+            syncDetect = { confidence: null, unverifiable: true,
+                           reason: data.error || 'detection failed', pending: false };
+            _renderSyncConfidence();
+            return;
+        }
+        // Server BPM wins (BPM detection moved server-side per issue #16);
+        // keep the client estimate only when the user set a manual override.
+        if (data.audio_bpm && data.audio_bpm > 0 && !(manualBpm > 0)) {
+            syncState.audioBPM = data.audio_bpm;
+        }
+        syncDetect = {
+            confidence: (typeof data.confidence === 'number') ? data.confidence : null,
+            unverifiable: !!data.unverifiable,
+            reason: data.reason || '',
+            pending: false,
+        };
+        const offsetInput = document.getElementById('sync-offset');
+        if (typeof data.offset_seconds === 'number' && isFinite(data.offset_seconds)) {
+            offsetInput.value = data.offset_seconds.toFixed(3);
+            document.getElementById('sync-offset-tag').textContent = '(auto)';
+        }
+        editorSyncUpdateFactor();
+        _renderSyncConfidence();
+    } catch (e) {
+        if (seq !== _syncDetectSeq) return;
+        syncDetect = { confidence: null, unverifiable: true,
+                       reason: 'detection unavailable', pending: false };
+        _renderSyncConfidence();
+    }
+}
+
+// Paint the confidence badge and toggle the low-confidence Apply gate.
+// Three distinct states (issue #16): "unverifiable" (no pitch check was
+// possible) reads differently from a low-confidence "verify" (a real
+// mismatch), which reads differently from a "good" match.
+function _renderSyncConfidence() {
+    const badge = document.getElementById('sync-confidence');
+    const lowRow = document.getElementById('sync-lowconf-row');
+    const confirmBox = document.getElementById('sync-confirm-lowconf');
+    if (!badge) return;
+    const d = syncDetect;
+    let low = false;
+    if (d.pending) {
+        badge.textContent = 'checking…';
+        badge.className = 'text-gray-500';
+    } else if (d.unverifiable) {
+        badge.textContent = d.reason ? `can't verify — ${d.reason}` : "can't verify";
+        badge.className = 'text-gray-400';
+    } else if (d.confidence === null) {
+        badge.textContent = '—';
+        badge.className = 'text-gray-500';
+    } else {
+        const pct = Math.round(d.confidence * 100);
+        if (d.confidence >= SYNC_CONFIDENCE_MIN) {
+            badge.textContent = `good (${pct}%)`;
+            badge.className = 'text-green-400';
+        } else {
+            badge.textContent = `low — verify (${pct}%)`;
+            badge.className = 'text-amber-400';
+            low = true;
+        }
+    }
+    if (lowRow) {
+        lowRow.classList.toggle('hidden', !low);
+        lowRow.classList.toggle('flex', low);
+    }
+    if (!low && confirmBox) confirmBox.checked = false;
+}
+
 window.editorSyncTempo = () => {
     if (!S.audioBuffer || S.beats.length < 2) {
         setStatus('Need audio and beats loaded for sync');
         return;
     }
 
-    setStatus('Detecting audio BPM...');
     syncState.tabBPM = getTabBPM();
+    // Client BPM is a placeholder shown instantly; the server's value
+    // replaces it when detectSyncFromServer() returns.
     syncState.audioBPM = detectAudioBPM();
 
     document.getElementById('sync-tab-bpm').textContent = syncState.tabBPM.toFixed(1);
     document.getElementById('sync-audio-bpm').textContent = syncState.audioBPM.toFixed(1);
     document.getElementById('sync-manual-bpm').value = '';
     document.getElementById('sync-offset').value = '0';
+    document.getElementById('sync-offset-tag').textContent = '';
+
+    // Scope persists across dialog opens — mirror the shared scope onto the
+    // dialog picker instead of resetting it to 'current' (issue #16).
+    setOffsetScope(getOffsetScope());
+
+    syncDetect = { confidence: null, unverifiable: false, reason: '', pending: false };
     editorSyncUpdateFactor();
+    _renderSyncConfidence();
 
     const dlg = document.getElementById('editor-sync-dialog');
     const btn = document.getElementById('editor-sync-btn');
@@ -3156,7 +3591,23 @@ window.editorSyncTempo = () => {
     dlg.style.left = rect.left + 'px';
     dlg.style.top = (rect.bottom + 4) + 'px';
     dlg.classList.remove('hidden');
+
+    // Kick off server-side chroma/DTW detection (BPM + offset).
+    detectSyncFromServer();
     setStatus('Ready');
+};
+
+window.editorSyncOffsetEdited = () => {
+    document.getElementById('sync-offset-tag').textContent = '';
+};
+
+// Manual BPM edited: update the factor immediately, then re-run detection
+// (debounced) so the offset is recomputed against the new tempo-corrected
+// timeline rather than the old one.
+window.editorSyncManualBpmEdited = () => {
+    editorSyncUpdateFactor();
+    if (_syncManualBpmTimer) clearTimeout(_syncManualBpmTimer);
+    _syncManualBpmTimer = setTimeout(() => { detectSyncFromServer(); }, 400);
 };
 
 window.editorSyncUpdateFactor = () => {
@@ -3183,22 +3634,40 @@ window.editorApplySync = () => {
 
     if (factor <= 0 || !isFinite(factor)) return;
 
-    // Scale all note times and sustains across every arrangement
-    _scaleAllArrangementTimes(factor, offset);
-
-    // Scale beat times
-    for (const b of S.beats) {
-        b.time = b.time / factor + offset;
+    // Low-confidence gate: a verifiable mismatch must be explicitly
+    // confirmed before it applies — a bad auto-suggestion shouldn't apply
+    // as easily as a good one (issue #16). "Unverifiable" cases (drums, no
+    // audio) are NOT gated — there's no mismatch to warn about.
+    const d = syncDetect;
+    const lowConf = !d.unverifiable && d.confidence !== null && d.confidence < SYNC_CONFIDENCE_MIN;
+    if (lowConf && !document.getElementById('sync-confirm-lowconf').checked) {
+        _renderSyncConfidence();
+        setStatus('Low-confidence match — tick the confirm box to apply, or edit the offset first');
+        return;
     }
 
-    // Scale section times
-    for (const s of S.sections) {
-        s.start_time = s.start_time / factor + offset;
-    }
+    const scopeAll = getOffsetScope() === 'all';
+    const targetArrangements = scopeAll ? S.arrangements : [S.arrangements[S.currentArr]];
+
+    // Apply through the undo system so Ctrl+Z reverts a bad sync instantly.
+    // In-memory only — nothing reaches disk until an explicit Save.
+    S.history.exec(new RescaleTimesCmd(() => {
+        // Scale note times and sustains across the chosen scope only.
+        _scaleAllArrangementTimes(factor, offset, targetArrangements);
+        // The shared beat/section grid only moves when every arrangement is
+        // being resynced together — see _scaleAllArrangementTimes' comment.
+        if (scopeAll) {
+            for (const b of S.beats) b.time = b.time / factor + offset;
+            for (const s of S.sections) s.start_time = s.start_time / factor + offset;
+        }
+    }));
 
     editorHideSyncDialog();
     draw();
-    setStatus(`Tempo synced: scaled ${factor.toFixed(4)}x` + (offset ? `, offset ${offset}s` : ''));
+    setStatus(
+        `Tempo synced (${scopeAll ? 'all arrangements' : 'this arrangement'}): ` +
+        `scaled ${factor.toFixed(4)}x` + (offset ? `, offset ${offset}s` : '')
+    );
 };
 
 // ════════════════════════════════════════════════════════════════════
@@ -3597,9 +4066,16 @@ window.editorDoCreate = async () => {
         S.cursorTime = 0;
         S.history = new EditHistory();
         S.createMode = true;
+        // Create-mode sessions are always freshly-imported PSARC — there's
+        // no manifest to carry lyrics.json, so nothing to load.
+        S.lyrics = [];
+        S.lyricSel = -1;
+        S.lyricsDirty = false;
+        _lyricNowIdx = -1;
 
-        // Reset offset UI so _effectiveAudioOffset() doesn't carry over a
-        // delta from a previous session's sync nudge.
+        // Reset offset UI + scope so neither _effectiveAudioOffset() nor the
+        // shared scope carry over from a previous session's sync nudge.
+        setOffsetScope('current');
         _resetOffsetUI();
 
         flattenChords();
@@ -3612,6 +4088,7 @@ window.editorDoCreate = async () => {
         document.getElementById('editor-play-btn').disabled = !data.audio_url;
         document.getElementById('editor-sync-btn').classList.toggle('hidden', !data.audio_url);
         document.getElementById('editor-replace-audio-btn').classList.remove('hidden');
+        document.getElementById('editor-lyrics-btn').classList.add('hidden');
         updateArrangementSelector();
         updateStatus();
         updateTimeDisplay();
@@ -3623,6 +4100,7 @@ window.editorDoCreate = async () => {
         // user makes a single edit — bypasses S.history like a MIDI take does.
         markSessionDirty();
         setStatus('Imported — edit notes then click Build CDLC');
+        refreshChordAnalysis(); // not awaited — fills in key/chords once the request lands
     } catch (e) {
         status.textContent = 'Import failed: ' + e.message;
         btn.disabled = false;
@@ -4908,6 +5386,46 @@ function _groupNotes(notes, chords, handshapes, { timeWindowMs = 150, fretSpanMa
 
     groups.sort((a, b) => a.time - b.time);
     return groups;
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Chord & key analysis — read-only, works for any format. Separate from
+// Generate Difficulties (sloppak-only, mutates phrases/handshapes) so the
+// key badge and chord labels populate on a plain load/arrangement switch.
+// ════════════════════════════════════════════════════════════════════
+
+async function refreshChordAnalysis() {
+    if (!S.sessionId || !S.arrangements.length) return;
+    const arr = S.arrangements[S.currentArr];
+    try {
+        const resp = await fetch('/api/plugins/editor/analyze-chords', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                arrangement: {
+                    name: arr.name,
+                    tuning: arr.tuning,
+                    notes: notes(),
+                    chords: chords(),
+                    handshapes: arr.handshapes || [],
+                },
+            }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data.error) return;
+        // The user may have switched arrangements while this request was
+        // in flight — a stale response would mislabel the new one.
+        if (S.arrangements[S.currentArr] !== arr) return;
+        S.songKey = data.key || '';
+        S.chordLabels = data.chords || [];
+        const keyBadge = document.getElementById('editor-key-badge');
+        if (keyBadge) keyBadge.textContent = S.songKey ? `Key: ${S.songKey}` : '';
+        const chordsBtn = document.getElementById('editor-chords-btn');
+        if (chordsBtn) chordsBtn.classList.toggle('hidden', !S.chordLabels.length);
+        draw();
+    } catch (e) {
+        // Non-fatal — chord/key display is a nice-to-have, not core editing.
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════

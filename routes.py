@@ -51,6 +51,23 @@ def setup(app, context):
 
     _chord_analysis = context["load_sibling"]("chord_analysis")
 
+    def _resolve_sandboxed_path(base_dir, rel):
+        """Resolve `rel` against `base_dir`, rejecting any path that escapes it.
+
+        Shared by the lyrics.json read/write paths — a manifest-supplied
+        relative path (e.g. `lyrics: lyrics.json`) must never be trusted to
+        stay inside the sloppak's own directory.
+        """
+        if not rel:
+            return None
+        base_resolved = Path(base_dir).resolve()
+        candidate = (Path(base_dir) / rel).resolve()
+        try:
+            candidate.relative_to(base_resolved)
+        except ValueError:
+            return None
+        return candidate
+
     # The editor needs to write extracted audio / art into a directory it
     # can also serve from. On the web Docker image `slopsmith/static/` is
     # writable, so historically the plugin reused that path and surfaced
@@ -489,6 +506,19 @@ def setup(app, context):
             _loaded_drum_tab = getattr(loaded, "drum_tab", None)
             if _loaded_drum_tab is not None:
                 result["drum_tab"] = _loaded_drum_tab
+            # Surface karaoke lyrics (word-level {t, d, w} timing) if the
+            # manifest references a lyrics file — e.g. produced by
+            # TabGrabber's sloppak exporter. Read-only pass-through here;
+            # save() writes edits back to this same file without ever
+            # touching the manifest's `lyrics` key itself.
+            _lyrics_path = _resolve_sandboxed_path(loaded.source_dir, loaded.manifest.get("lyrics"))
+            if _lyrics_path is not None and _lyrics_path.exists():
+                try:
+                    _lyrics_data = json.loads(_lyrics_path.read_text(encoding="utf-8"))
+                    if isinstance(_lyrics_data, list):
+                        result["lyrics"] = _lyrics_data
+                except (OSError, json.JSONDecodeError) as e:
+                    log.warning("[Editor] Failed to read lyrics.json: %s", e)
             # Carry the manifest-derived arrangement id list onto each
             # arrangement so the frontend can round-trip it back to us.
             # Use a single `used_ids` set when generating fallback ids so two
@@ -663,6 +693,21 @@ def setup(app, context):
         ):
             return JSONResponse(
                 {"error": "drum_tab can only be saved to sloppak-format songs"},
+                status_code=400,
+            )
+
+        # Lyrics payload: edited karaoke word-timing list from the frontend.
+        # Absent key → no-op (matches drum_tab's sentinel convention, just
+        # without the create/remove states — lyrics.json is edit-only, see
+        # `_save_sloppak` below). Only ever applies to sloppak sessions,
+        # since that's the only format the .sloppak lyrics.json convention
+        # exists for.
+        lyrics_payload = data.get("lyrics")
+        if lyrics_payload is not None and not isinstance(lyrics_payload, list):
+            return JSONResponse({"error": "lyrics must be a list"}, 400)
+        if lyrics_payload is not None and session.get("format") != "sloppak":
+            return JSONResponse(
+                {"error": "lyrics can only be saved to sloppak-format songs"},
                 status_code=400,
             )
         # Schema-validate a dict payload at the request boundary, using the
@@ -1125,6 +1170,20 @@ def setup(app, context):
                 else:
                     drum_tab_path.unlink(missing_ok=True)
                     manifest.pop("drum_tab", None)
+
+            # Lyrics persist: edit-only, refreshes the file the manifest's
+            # `lyrics` key already points at (e.g. TabGrabber's lyrics.json).
+            # Never adds or removes the manifest key itself — authoring new
+            # lyrics from a song that never had any is out of scope.
+            if lyrics_payload is not None and manifest.get("lyrics"):
+                _lyrics_path = _resolve_sandboxed_path(source_dir, manifest.get("lyrics"))
+                if _lyrics_path is None:
+                    raise RuntimeError("lyrics path escapes sandbox")
+                _lyrics_path.parent.mkdir(parents=True, exist_ok=True)
+                _lyrics_path.write_text(
+                    json.dumps(lyrics_payload, separators=(",", ":")),
+                    encoding="utf-8",
+                )
 
             # Apply edited top-level metadata (title/artist/album/year only —
             # don't let the editor overwrite stems/lyrics/cover paths).
@@ -2619,6 +2678,441 @@ def setup(app, context):
             result = await asyncio.get_event_loop().run_in_executor(None, _run)
         except Exception as e:
             log.exception("generate-difficulties failed for session %r", data.get("session_id", ""))
+            return JSONResponse({"error": str(e)}, 500)
+
+        return result
+
+    # ── Detect song key and label chords over the timeline ───────────
+    #
+    # Read-only sibling of generate-difficulties: reuses the same key
+    # detection and note-grouping helpers, but doesn't mutate phrases/
+    # handshapes and works for any format (not just sloppak), so it can
+    # run right after a plain load instead of requiring the user to click
+    # "⋮ Difficulties" first.
+
+    @app.post("/api/plugins/editor/analyze-chords")
+    async def analyze_chords(data: dict):
+        arr_data = data.get("arrangement")
+        if not arr_data:
+            return JSONResponse({"error": "arrangement data required"}, 400)
+
+        notes = arr_data.get("notes", [])
+        chords = arr_data.get("chords", [])
+        handshapes = arr_data.get("handshapes", [])
+        tuning = arr_data.get("tuning", [0] * 6)
+        is_keys = _is_keys_arr(arr_data.get("name", ""))
+
+        def _run():
+            detect_key = _chord_analysis.detect_key
+            key_name = _chord_analysis.key_name
+            name_chord = _chord_analysis.name_chord
+            fret_to_midi = _chord_analysis.fret_to_midi
+
+            # ── Key detection (same approach as generate-difficulties) ──
+            all_notes = list(notes)
+            for ch in chords:
+                for cn in ch.get("notes", []):
+                    all_notes.append({
+                        "string": cn.get("string", 0),
+                        "fret": cn.get("fret", 0),
+                        "sustain": cn.get("sustain", ch.get("sustain", 0)),
+                    })
+            if is_keys:
+                key = detect_key(all_notes, tuning,
+                                 pcs=_chord_analysis.notes_to_pitch_classes_keys(all_notes))
+            else:
+                key = detect_key(all_notes, tuning)
+            detected_key_name = key_name(key)
+
+            # ── Label simultaneous-note groups as chords ─────────────
+            groups = _group_notes_impl(notes, chords, handshapes, is_keys=is_keys)
+            chords_out = []
+            for g in groups:
+                g_notes = g.get("notes") or []
+                if len(g_notes) < 2:
+                    continue  # a single note isn't a chord
+                if is_keys:
+                    midis = [int(n.get("string", 0)) * 24 + int(n.get("fret", 0)) for n in g_notes]
+                else:
+                    midis = [fret_to_midi(n.get("string", 0), n.get("fret", 0), tuning) for n in g_notes]
+                if not midis:
+                    continue
+                pcs = frozenset(m % 12 for m in midis)
+                lowest_pc = min(midis) % 12
+                chords_out.append({
+                    "time": round(float(g.get("time", 0)), 3),
+                    "name": name_chord(pcs, key, lowest_pc),
+                })
+            chords_out.sort(key=lambda c: c["time"])
+
+            return {"key": detected_key_name, "chords": chords_out}
+
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(None, _run)
+        except Exception as e:
+            log.exception("analyze-chords failed")
+            return JSONResponse({"error": str(e)}, 500)
+
+        return result
+
+    # ── Sync Tempo / Offset — chroma+DTW alignment (issue #16) ───────
+    #
+    # Read-only redesign of the old client-side onset-energy correlation.
+    # Symbolic chroma from the arrangement's opening notes is aligned
+    # against the audio's `librosa.feature.chroma_cqt` via subsequence
+    # `librosa.sequence.dtw`; BPM detection shares the same spectral pass.
+    # The route never writes to disk or session state — Apply stays
+    # client-side/in-memory via RescaleTimesCmd (undoable), and nothing
+    # reaches disk until an explicit Save. The four helpers below are the
+    # executable contract in tests/test_sync_offset.py.
+
+    # How far past the first opening note to still count a note as part of
+    # the alignment "pattern window" — mirrors the old client-side
+    # SYNC_OFFSET_SEARCH_SECONDS "first several notes" concept. (The
+    # AST-extracted helpers keep their own local copy so they can run
+    # standalone in tests/test_sync_offset.py; this one is for the route.)
+    _SYNC_WINDOW_SEC = 2.5
+
+    def _select_stem_for_arrangement(stems, arrangement_name):
+        """Pick the manifest stem file best matching `arrangement_name`.
+
+        Read-only: reads only stems the manifest already lists — never
+        invokes live stem separation (Demucs). Matching rule (issue #16
+        default; see tests/test_sync_offset.py):
+          - name containing "bass" -> stem id "bass"
+          - name matching the keys pattern -> stem id "piano"
+          - otherwise -> stem id "guitar"
+        Falls back to id "full", then the first stem, when the matched id
+        isn't present. Returns the stem's `file` string, or None for an
+        empty stem list.
+        """
+        if not stems:
+            return None
+        import re
+        name = (arrangement_name or "").strip().lower()
+        if "bass" in name:
+            want = "bass"
+        elif re.match(r"^(keys|piano|keyboard|synth)", name):
+            want = "piano"
+        else:
+            want = "guitar"
+        by_id = {}
+        for s in stems:
+            sid = str(s.get("id", "")).lower()
+            by_id.setdefault(sid, s.get("file"))
+        if want in by_id:
+            return by_id[want]
+        if "full" in by_id:
+            return by_id["full"]
+        return stems[0].get("file")
+
+    def _note_onset_pitch_classes(notes, tuning, is_keys, chord_analysis):
+        """(time, pitch_class, weight) for each note in `notes`.
+
+        Reuses `chord_analysis.fret_to_midi` for guitar/bass (mirroring the
+        analyze-chords route), or the `string*24 + fret` keys encoding.
+        `weight` is the note's sustain, defaulting to 1.0 when absent/zero.
+        """
+        events = []
+        for n in notes:
+            string = int(n.get("string", 0) or 0)
+            fret = int(n.get("fret", 0) or 0)
+            if is_keys:
+                midi = string * 24 + fret
+            else:
+                midi = chord_analysis.fret_to_midi(string, fret, tuning)
+            pc = int(midi) % 12
+            t = float(n.get("time", 0.0) or 0.0)
+            try:
+                weight = float(n.get("sustain", 0) or 0)
+            except (TypeError, ValueError):
+                weight = 0.0
+            if weight <= 0:
+                weight = 1.0
+            events.append((t, pc, weight))
+        return events
+
+    def _chroma_frames_from_pitch_events(events, hop_seconds, n_frames):
+        """Bin (time, pitch_class, weight) events into a (12, n_frames) grid.
+
+        Same orientation as `librosa.feature.chroma_cqt` output so the two
+        can be compared directly by `librosa.sequence.dtw`. No audio, no
+        chord_analysis dependency — a note lands in the frame nearest its
+        onset time.
+        """
+        import numpy as np
+        frames = np.zeros((12, int(n_frames)), dtype=np.float64)
+        if not events or n_frames <= 0 or hop_seconds <= 0:
+            return frames
+        for t, pc, weight in events:
+            idx = int(round(float(t) / hop_seconds))
+            if 0 <= idx < n_frames:
+                frames[int(pc) % 12, idx] += float(weight)
+        return frames
+
+    def _detect_bpm_and_offset(y, sr, arr_notes, tuning, is_keys,
+                               manual_bpm=None, tab_bpm=None,
+                               audio_chroma=None):
+        """BPM (via beat_track) + chroma/DTW offset for the opening notes.
+
+        Returns {"audio_bpm", "offset_seconds", "confidence"} with
+        confidence continuous in [0.0, 1.0] from the DTW alignment quality.
+        `offset_seconds` is measured against the TEMPO-CORRECTED note times
+        (note.time / factor) — the bug the reverted attempt had was
+        measuring against raw tab times. `factor` = effective_bpm / tab_bpm
+        (effective_bpm is `manual_bpm` when given, else the detected BPM),
+        or 1.0 when tab_bpm is unknown. `audio_chroma`, when supplied, is a
+        precomputed `chroma_cqt` matrix reused across a manual-BPM
+        re-trigger (only the symbolic/alignment side changes) — the route
+        caches it per session so the audio isn't re-analyzed each time.
+        """
+        import numpy as np
+        import librosa
+
+        # chord_analysis is a setup-closure (`_chord_analysis`) at runtime,
+        # but a plain global in the AST-extracted unit-test namespace.
+        try:
+            ca_mod = chord_analysis
+        except NameError:
+            ca_mod = _chord_analysis
+
+        # Kept local (not a setup-level constant) so the AST-extraction test
+        # in tests/test_sync_offset.py can exec this helper standalone.
+        window_sec = 2.5
+        hop = 512
+        hop_seconds = hop / float(sr)
+
+        # ── BPM: shared onset-strength pass feeds beat tracking ──────────
+        audio_bpm = 0.0
+        try:
+            onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+            tempo, _beats = librosa.beat.beat_track(
+                onset_envelope=onset_env, sr=sr, hop_length=hop)
+            audio_bpm = float(np.atleast_1d(tempo)[0])
+        except Exception:
+            audio_bpm = 0.0
+
+        zero = {"audio_bpm": audio_bpm, "offset_seconds": 0.0, "confidence": 0.0}
+        if not arr_notes:
+            return zero
+
+        # Opening-notes pattern window.
+        raw_times = [float(n.get("time", 0.0) or 0.0) for n in arr_notes]
+        t0 = min(raw_times)
+        window_notes = [
+            n for n in arr_notes
+            if float(n.get("time", 0.0) or 0.0) <= t0 + window_sec
+        ]
+        events_raw = _note_onset_pitch_classes(
+            window_notes, tuning, is_keys, ca_mod)
+        if not events_raw:
+            return zero
+
+        # Tempo factor: effective (detected or manual) BPM vs the tab's.
+        effective_bpm = manual_bpm if (manual_bpm and manual_bpm > 0) else audio_bpm
+        if tab_bpm and tab_bpm > 0 and effective_bpm and effective_bpm > 0:
+            factor = effective_bpm / tab_bpm
+        else:
+            factor = 1.0
+        if not factor or factor <= 0:
+            factor = 1.0
+
+        # Symbolic chroma, anchored at the first tempo-corrected note time
+        # and expanded across each note's sustain so short single notes
+        # still give DTW a few frames to lock onto.
+        corrected = [(t / factor, pc, w) for (t, pc, w) in events_raw]
+        first_corrected = min(t for t, _, _ in corrected)
+        expanded = []
+        for t, pc, w in corrected:
+            rel = t - first_corrected
+            dur = max(float(w), hop_seconds)
+            n_span = max(1, int(round(dur / hop_seconds)))
+            for k in range(n_span):
+                expanded.append((rel + k * hop_seconds, pc, 1.0))
+        max_rel = max(t for t, _, _ in expanded)
+        n_frames_sym = int(round(max_rel / hop_seconds)) + 1
+        sym = _chroma_frames_from_pitch_events(expanded, hop_seconds, n_frames_sym)
+        sym = sym + 1e-6  # keep every column non-zero for the cosine metric
+
+        # Audio chroma over the loaded window (reused across manual-BPM
+        # re-triggers when the route hands one in).
+        try:
+            if audio_chroma is not None:
+                chroma = audio_chroma
+            else:
+                chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+        except Exception:
+            return zero
+        chroma = chroma + 1e-6
+        if chroma.shape[1] < 1:
+            return zero
+        # Subsequence DTW needs the query no longer than the target.
+        if sym.shape[1] >= chroma.shape[1]:
+            sym = sym[:, : max(1, chroma.shape[1] - 1)]
+            if sym.shape[1] < 1:
+                return zero
+
+        try:
+            D, wp = librosa.sequence.dtw(
+                X=sym, Y=chroma, metric="cosine", subseq=True)
+        except Exception:
+            return zero
+
+        # wp is returned end->start; wp[-1] = (symbolic frame 0, audio frame).
+        audio_start_frame = int(wp[-1][1])
+        audio_start_time = float(
+            librosa.frames_to_time(audio_start_frame, sr=sr, hop_length=hop))
+        offset_seconds = float(audio_start_time - first_corrected)
+
+        # Confidence: mean cosine similarity of the aligned frame pairs,
+        # scaled by how much the winning window beats the average match
+        # across the audio (peakiness) so a flat/silent track can't score
+        # high just by picking its least-bad frame.
+        sims = []
+        for i, j in wp:
+            a = sym[:, int(i)]
+            b = chroma[:, int(j)]
+            denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+            if denom > 0:
+                sims.append(float(np.dot(a, b) / denom))
+        path_sim = float(np.mean(sims)) if sims else 0.0
+
+        # Baseline: average best-per-frame similarity of the symbolic
+        # pattern's mean pitch profile against the whole track. If the
+        # winning alignment barely exceeds this, there's no real match.
+        sym_mean = sym.mean(axis=1)
+        sm_norm = float(np.linalg.norm(sym_mean))
+        if sm_norm > 0:
+            col_norms = np.linalg.norm(chroma, axis=0)
+            col_norms[col_norms == 0] = 1e-9
+            frame_sims = (sym_mean @ chroma) / (sm_norm * col_norms)
+            baseline = float(np.mean(frame_sims))
+        else:
+            baseline = 0.0
+        peakiness = float(np.clip(path_sim - baseline, 0.0, 1.0))
+        confidence = float(np.clip(0.5 * path_sim + 0.5 * (path_sim * peakiness * 4.0),
+                                   0.0, 1.0))
+
+        return {
+            "audio_bpm": float(audio_bpm),
+            "offset_seconds": offset_seconds,
+            "confidence": confidence,
+        }
+
+    @app.post("/api/plugins/editor/detect-sync-offset")
+    async def detect_sync_offset(data: dict):
+        """Read-only: suggest {audio_bpm, offset_seconds, confidence} for the
+        Sync dialog. Never writes to disk or session state."""
+        session_id = data.get("session_id", "")
+        session = sessions.get(session_id)
+        if not session:
+            return JSONResponse({"error": "session not found"}, 400)
+
+        arr_data = data.get("arrangement") or {}
+        arr_notes = arr_data.get("notes", []) or []
+        tuning = arr_data.get("tuning", [0] * 6)
+        arr_name = arr_data.get("name", "")
+        is_keys = _is_keys_arr(arr_name)
+        is_drums = arr_name.strip().lower().startswith("drum")
+        try:
+            manual_bpm = float(data.get("manual_bpm")) if data.get("manual_bpm") else None
+        except (TypeError, ValueError):
+            manual_bpm = None
+        try:
+            tab_bpm = float(data.get("tab_bpm")) if data.get("tab_bpm") else None
+        except (TypeError, ValueError):
+            tab_bpm = None
+
+        # Fail fast before any librosa work (matches the test contract):
+        # no notes, or no audio on the session, -> zero-confidence sentinel.
+        if not arr_notes:
+            return {"audio_bpm": 0.0, "offset_seconds": 0.0, "confidence": 0.0,
+                    "unverifiable": True, "reason": "no notes in opening window"}
+
+        # Resolve the audio source. Prefer a manifest stem whose id matches
+        # the arrangement instrument; fall back to the session's audio_file.
+        audio_path = session.get("audio_file") or ""
+        stems = []
+        sloppak_state = session.get("sloppak_state") or {}
+        manifest = (sloppak_state.get("manifest") or {}) if isinstance(sloppak_state, dict) else {}
+        stems = manifest.get("stems") or []
+        if stems:
+            rel = _select_stem_for_arrangement(stems, arr_name)
+            if rel:
+                candidate = _resolve_sandboxed_path(session.get("dir", ""), rel)
+                if candidate is not None and candidate.exists():
+                    audio_path = str(candidate)
+
+        if not audio_path or not Path(audio_path).exists():
+            return {"audio_bpm": 0.0, "offset_seconds": 0.0, "confidence": 0.0,
+                    "unverifiable": True, "reason": "session has no audio"}
+
+        # Chroma is meaningless for unpitched drum data — skip the check.
+        if is_drums:
+            return {"audio_bpm": 0.0, "offset_seconds": 0.0, "confidence": 0.0,
+                    "unverifiable": True, "reason": "drum arrangement (unpitched)"}
+
+        def _run():
+            import librosa
+            # Partial, downsampled load: decode only the window around the
+            # opening notes (a few seconds past the first note), mono at
+            # 22050 Hz — enough for chroma/beat work, far cheaper than the
+            # whole song.
+            raw_times = [float(n.get("time", 0.0) or 0.0) for n in arr_notes]
+            t0 = min(raw_times) if raw_times else 0.0
+            # Load generously around the search window so the true onset is
+            # inside the decoded region regardless of the current offset.
+            load_dur = max(8.0, t0 + _SYNC_WINDOW_SEC + 6.0)
+            # Per-session chroma cache, keyed by the audio source + window.
+            # A manual-BPM re-trigger only changes the symbolic/alignment
+            # side, so the audio chroma (the expensive CQT) is reused rather
+            # than recomputed; keying by audio_path invalidates it on an
+            # audio replace. Only the most recent entry is kept.
+            cache = session.setdefault("_sync_audio_cache", {})
+            cache_key = (audio_path, round(load_dur, 1))
+            cached = cache.get(cache_key)
+            if cached is not None:
+                sr, audio_chroma = cached["sr"], cached["chroma"]
+                y = None  # not needed — chroma is cached; BPM below reuses it
+                audio_bpm = cached["audio_bpm"]
+            else:
+                y, sr = librosa.load(audio_path, sr=22050, mono=True,
+                                     offset=0.0, duration=load_dur)
+                audio_chroma = librosa.feature.chroma_cqt(
+                    y=y, sr=sr, hop_length=512)
+                # BPM only depends on the audio, so cache it alongside.
+                try:
+                    onset_env = librosa.onset.onset_strength(
+                        y=y, sr=sr, hop_length=512)
+                    tempo, _b = librosa.beat.beat_track(
+                        onset_envelope=onset_env, sr=sr, hop_length=512)
+                    import numpy as _np
+                    audio_bpm = float(_np.atleast_1d(tempo)[0])
+                except Exception:
+                    audio_bpm = 0.0
+                cache.clear()  # bound memory: keep only the latest window
+                cache[cache_key] = {"sr": sr, "chroma": audio_chroma,
+                                    "audio_bpm": audio_bpm}
+            # `y` may be None on a cache hit; _detect_bpm_and_offset only
+            # touches `y` for its own beat_track fallback, which we skip by
+            # handing it the cached chroma. Pass a tiny dummy so the shared
+            # spectral call inside doesn't run on a cache hit.
+            import numpy as _np
+            y_for_call = y if y is not None else _np.zeros(1, dtype=_np.float32)
+            result = _detect_bpm_and_offset(
+                y_for_call, sr, arr_notes, tuning, is_keys,
+                manual_bpm=manual_bpm, tab_bpm=tab_bpm,
+                audio_chroma=audio_chroma)
+            # Prefer the cached/real BPM over whatever the dummy-y beat_track
+            # produced on a cache hit.
+            if audio_bpm:
+                result["audio_bpm"] = audio_bpm
+            return result
+
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(None, _run)
+        except Exception as e:
+            log.exception("detect-sync-offset failed")
             return JSONResponse({"error": str(e)}, 500)
 
         return result
