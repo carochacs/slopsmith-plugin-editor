@@ -2838,12 +2838,34 @@ def setup(app, context):
     # reaches disk until an explicit Save. The four helpers below are the
     # executable contract in tests/test_sync_offset.py.
 
-    # How far past the first opening note to still count a note as part of
-    # the alignment "pattern window" — mirrors the old client-side
-    # SYNC_OFFSET_SEARCH_SECONDS "first several notes" concept. (The
-    # AST-extracted helpers keep their own local copy so they can run
-    # standalone in tests/test_sync_offset.py; this one is for the route.)
-    _SYNC_WINDOW_SEC = 2.5
+    # Opening-notes pattern window (kept in sync with `_detect_bpm_and_offset`'s
+    # own local `window_sec`), and how far on either side of the expected
+    # onset the offset may be searched. The route decodes only
+    # [t0 - search, t0 + window + search] so subsequence DTW can't lock onto a
+    # far-away recurrence of the opening pitch classes.
+    _SYNC_WINDOW_SEC = 5.0
+    _SYNC_SEARCH_SEC = 3.0
+
+    def _select_bpm_stem(stems):
+        """Pick the stem best suited to BEAT TRACKING: prefer drums (clean
+        percussive onsets — the reliable tempo source), then a full mix, then
+        the first stem. Returns the stem `file`, or None for an empty list.
+
+        Rationale (issue #16 follow-up, validated on real files): beat
+        tracking a short window of an isolated melodic stem octave/meter-errors
+        badly (a 77 BPM guitar stem read 152; a 7/8 song read 112), while the
+        drums stem tracks tempo cleanly.
+        """
+        if not stems:
+            return None
+        by_id = {}
+        for s in stems:
+            sid = str(s.get("id", "")).lower()
+            by_id.setdefault(sid, s.get("file"))
+        for want in ("drums", "full"):
+            if want in by_id:
+                return by_id[want]
+        return stems[0].get("file")
 
     def _select_stem_for_arrangement(stems, arrangement_name):
         """Pick the manifest stem file best matching `arrangement_name`.
@@ -2924,8 +2946,9 @@ def setup(app, context):
 
     def _detect_bpm_and_offset(y, sr, arr_notes, tuning, is_keys,
                                manual_bpm=None, tab_bpm=None,
-                               audio_chroma=None):
-        """BPM (via beat_track) + chroma/DTW offset for the opening notes.
+                               audio_chroma=None, load_offset=0.0,
+                               audio_bpm=None):
+        """BPM + chroma/DTW offset for the opening notes.
 
         Returns {"audio_bpm", "offset_seconds", "confidence"} with
         confidence continuous in [0.0, 1.0] from the DTW alignment quality.
@@ -2933,10 +2956,22 @@ def setup(app, context):
         (note.time / factor) — the bug the reverted attempt had was
         measuring against raw tab times. `factor` = effective_bpm / tab_bpm
         (effective_bpm is `manual_bpm` when given, else the detected BPM),
-        or 1.0 when tab_bpm is unknown. `audio_chroma`, when supplied, is a
-        precomputed `chroma_cqt` matrix reused across a manual-BPM
-        re-trigger (only the symbolic/alignment side changes) — the route
-        caches it per session so the audio isn't re-analyzed each time.
+        or 1.0 when tab_bpm is unknown.
+
+        When `tab_bpm` is known it (a) seeds beat tracking with it as a prior
+        and folds the detected tempo to the octave nearest it — beat trackers
+        octave/meter-error badly on short or isolated windows (a real Pearl
+        Jam guitar stem read 152 for a 77 BPM song; Money's 7/8 read 112) —
+        and (b) snaps a near-unity detected factor to exactly 1 so a small
+        tempo error can't rescale an already-aligned tab.
+
+        `audio_bpm`, when supplied, is a tempo the caller already measured
+        (e.g. once over the whole song, from the drums stem) — used instead
+        of beat-tracking the short local `y`, which is unreliable. `load_offset`
+        is the absolute time (s) the loaded `y` begins at, so the returned
+        offset stays in the tab's absolute timeline when the route decodes
+        only a local window. `audio_chroma`, when supplied, is a precomputed
+        `chroma_cqt` reused across a manual-BPM re-trigger.
         """
         import numpy as np
         import librosa
@@ -2948,21 +2983,37 @@ def setup(app, context):
         except NameError:
             ca_mod = _chord_analysis
 
-        # Kept local (not a setup-level constant) so the AST-extraction test
-        # in tests/test_sync_offset.py can exec this helper standalone.
-        window_sec = 2.5
+        # Kept local (not setup-level constants) so the AST-extraction test in
+        # tests/test_sync_offset.py can exec this helper standalone. A wider
+        # opening window than the original 2.5s pulls in a few more notes,
+        # giving DTW a more distinctive pattern to localize.
+        window_sec = 5.0
+        max_note_fill_sec = 0.5  # cap per-note sustain fill; long rings smear
         hop = 512
         hop_seconds = hop / float(sr)
 
-        # ── BPM: shared onset-strength pass feeds beat tracking ──────────
-        audio_bpm = 0.0
-        try:
-            onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
-            tempo, _beats = librosa.beat.beat_track(
-                onset_envelope=onset_env, sr=sr, hop_length=hop)
-            audio_bpm = float(np.atleast_1d(tempo)[0])
-        except Exception:
+        # ── BPM: use a caller-supplied tempo if given (measured over a long
+        # window / percussive stem), else beat-track `y`, primed with the tab
+        # tempo when known so octave/meter errors are corrected. ───────────
+        if audio_bpm is None:
             audio_bpm = 0.0
+            try:
+                onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+                start_bpm = float(tab_bpm) if (tab_bpm and tab_bpm > 0) else 120.0
+                tempo, _beats = librosa.beat.beat_track(
+                    onset_envelope=onset_env, sr=sr, hop_length=hop,
+                    start_bpm=start_bpm)
+                audio_bpm = float(np.atleast_1d(tempo)[0])
+            except Exception:
+                audio_bpm = 0.0
+        else:
+            audio_bpm = float(audio_bpm)
+        # Fold to the octave (x0.5 / x1 / x2 ...) closest to the tab tempo.
+        if tab_bpm and tab_bpm > 0 and audio_bpm > 0:
+            while audio_bpm / tab_bpm > 1.4:
+                audio_bpm /= 2.0
+            while audio_bpm / tab_bpm < 0.71:
+                audio_bpm *= 2.0
 
         zero = {"audio_bpm": audio_bpm, "offset_seconds": 0.0, "confidence": 0.0}
         if not arr_notes:
@@ -2981,23 +3032,33 @@ def setup(app, context):
             return zero
 
         # Tempo factor: effective (detected or manual) BPM vs the tab's.
-        effective_bpm = manual_bpm if (manual_bpm and manual_bpm > 0) else audio_bpm
+        using_detected = not (manual_bpm and manual_bpm > 0)
+        effective_bpm = manual_bpm if not using_detected else audio_bpm
         if tab_bpm and tab_bpm > 0 and effective_bpm and effective_bpm > 0:
             factor = effective_bpm / tab_bpm
         else:
             factor = 1.0
         if not factor or factor <= 0:
             factor = 1.0
+        # A near-1 factor from fuzzy beat tracking shouldn't rescale an
+        # already-aligned tab — snap it. A manual override is taken as-is.
+        if using_detected and abs(factor - 1.0) < 0.05:
+            factor = 1.0
+        # Report a BPM consistent with the factor actually used below: the
+        # client derives its own factor as audio_bpm / tab_bpm, so a
+        # folded/snapped factor and the reported BPM must agree.
+        if tab_bpm and tab_bpm > 0 and using_detected:
+            audio_bpm = tab_bpm * factor
 
         # Symbolic chroma, anchored at the first tempo-corrected note time
-        # and expanded across each note's sustain so short single notes
-        # still give DTW a few frames to lock onto.
+        # and expanded across each note's (capped) sustain so short single
+        # notes still give DTW a few frames to lock onto.
         corrected = [(t / factor, pc, w) for (t, pc, w) in events_raw]
         first_corrected = min(t for t, _, _ in corrected)
         expanded = []
         for t, pc, w in corrected:
             rel = t - first_corrected
-            dur = max(float(w), hop_seconds)
+            dur = min(max(float(w), hop_seconds), max_note_fill_sec)
             n_span = max(1, int(round(dur / hop_seconds)))
             for k in range(n_span):
                 expanded.append((rel + k * hop_seconds, pc, 1.0))
@@ -3031,8 +3092,10 @@ def setup(app, context):
             return zero
 
         # wp is returned end->start; wp[-1] = (symbolic frame 0, audio frame).
+        # Add load_offset so the result is in the tab's absolute timeline even
+        # when the route decoded only a local window around the opening notes.
         audio_start_frame = int(wp[-1][1])
-        audio_start_time = float(
+        audio_start_time = float(load_offset) + float(
             librosa.frames_to_time(audio_start_frame, sr=sr, hop_length=hop))
         offset_seconds = float(audio_start_time - first_corrected)
 
@@ -3101,19 +3164,30 @@ def setup(app, context):
             return {"audio_bpm": 0.0, "offset_seconds": 0.0, "confidence": 0.0,
                     "unverifiable": True, "reason": "no notes in opening window"}
 
-        # Resolve the audio source. Prefer a manifest stem whose id matches
-        # the arrangement instrument; fall back to the session's audio_file.
-        audio_path = session.get("audio_file") or ""
-        stems = []
+        # Two audio sources:
+        #  - OFFSET/chroma: the stem matching the arrangement instrument (the
+        #    frontend sends the Bass arrangement for an all-arrangements sync,
+        #    since bass lines chroma-match cleanly — validated on real files).
+        #  - BPM/beat: the drums stem (or full mix), which tracks tempo far
+        #    more reliably than a short window of an isolated melodic stem.
         sloppak_state = session.get("sloppak_state") or {}
         manifest = (sloppak_state.get("manifest") or {}) if isinstance(sloppak_state, dict) else {}
         stems = manifest.get("stems") or []
+        session_dir = session.get("dir", "")
+
+        audio_path = session.get("audio_file") or ""   # offset/chroma source
+        bpm_path = audio_path                            # beat-tracking source
         if stems:
             rel = _select_stem_for_arrangement(stems, arr_name)
             if rel:
-                candidate = _resolve_sandboxed_path(session.get("dir", ""), rel)
-                if candidate is not None and candidate.exists():
-                    audio_path = str(candidate)
+                cand = _resolve_sandboxed_path(session_dir, rel)
+                if cand is not None and cand.exists():
+                    audio_path = str(cand)
+            brel = _select_bpm_stem(stems)
+            if brel:
+                bcand = _resolve_sandboxed_path(session_dir, brel)
+                if bcand is not None and bcand.exists():
+                    bpm_path = str(bcand)
 
         if not audio_path or not Path(audio_path).exists():
             return {"audio_bpm": 0.0, "offset_seconds": 0.0, "confidence": 0.0,
@@ -3126,60 +3200,52 @@ def setup(app, context):
 
         def _run():
             import librosa
-            # Partial, downsampled load: decode only the window around the
-            # opening notes (a few seconds past the first note), mono at
-            # 22050 Hz — enough for chroma/beat work, far cheaper than the
-            # whole song.
+            import numpy as _np
+            cache = session.setdefault("_sync_audio_cache", {})
+
+            # ── BPM: measured ONCE over the whole song (downsampled, from the
+            # drums/mix stem), primed with the tab tempo. Beat-tracking a short
+            # local window of one stem is unreliable (octave/meter errors); the
+            # whole song is stable. Cached per bpm source. ────────────────────
+            bkey = ("bpm", bpm_path, round(tab_bpm or 0, 1))
+            bcached = cache.get(bkey)
+            if bcached is not None:
+                song_bpm = bcached
+            else:
+                try:
+                    yb, srb = librosa.load(bpm_path, sr=11025, mono=True)
+                    oe = librosa.onset.onset_strength(y=yb, sr=srb, hop_length=512)
+                    start_bpm = float(tab_bpm) if (tab_bpm and tab_bpm > 0) else 120.0
+                    tempo = librosa.beat.beat_track(
+                        onset_envelope=oe, sr=srb, hop_length=512, start_bpm=start_bpm)[0]
+                    song_bpm = float(_np.atleast_1d(tempo)[0])
+                except Exception:
+                    song_bpm = 0.0
+                cache[bkey] = song_bpm
+
+            # ── OFFSET: decode only a LOCAL window around the opening notes so
+            # subsequence DTW can't lock onto a far-away recurrence of the
+            # opening pitch classes; carry load_offset so the result stays in
+            # the absolute timeline. Cache the decoded window + its chroma. ────
             raw_times = [float(n.get("time", 0.0) or 0.0) for n in arr_notes]
             t0 = min(raw_times) if raw_times else 0.0
-            # Load generously around the search window so the true onset is
-            # inside the decoded region regardless of the current offset.
-            load_dur = max(8.0, t0 + _SYNC_WINDOW_SEC + 6.0)
-            # Per-session chroma cache, keyed by the audio source + window.
-            # A manual-BPM re-trigger only changes the symbolic/alignment
-            # side, so the audio chroma (the expensive CQT) is reused rather
-            # than recomputed; keying by audio_path invalidates it on an
-            # audio replace. Only the most recent entry is kept.
-            cache = session.setdefault("_sync_audio_cache", {})
-            cache_key = (audio_path, round(load_dur, 1))
-            cached = cache.get(cache_key)
-            if cached is not None:
-                sr, audio_chroma = cached["sr"], cached["chroma"]
-                y = None  # not needed — chroma is cached; BPM below reuses it
-                audio_bpm = cached["audio_bpm"]
+            load_offset = max(0.0, t0 - _SYNC_SEARCH_SEC)
+            load_dur = max((t0 + _SYNC_WINDOW_SEC + _SYNC_SEARCH_SEC) - load_offset, 6.0)
+            okey = ("off", audio_path, round(load_offset, 2), round(load_dur, 2))
+            ocached = cache.get(okey)
+            if ocached is not None:
+                y, sr, audio_chroma = ocached["y"], ocached["sr"], ocached["chroma"]
             else:
                 y, sr = librosa.load(audio_path, sr=22050, mono=True,
-                                     offset=0.0, duration=load_dur)
-                audio_chroma = librosa.feature.chroma_cqt(
-                    y=y, sr=sr, hop_length=512)
-                # BPM only depends on the audio, so cache it alongside.
-                try:
-                    onset_env = librosa.onset.onset_strength(
-                        y=y, sr=sr, hop_length=512)
-                    tempo, _b = librosa.beat.beat_track(
-                        onset_envelope=onset_env, sr=sr, hop_length=512)
-                    import numpy as _np
-                    audio_bpm = float(_np.atleast_1d(tempo)[0])
-                except Exception:
-                    audio_bpm = 0.0
-                cache.clear()  # bound memory: keep only the latest window
-                cache[cache_key] = {"sr": sr, "chroma": audio_chroma,
-                                    "audio_bpm": audio_bpm}
-            # `y` may be None on a cache hit; _detect_bpm_and_offset only
-            # touches `y` for its own beat_track fallback, which we skip by
-            # handing it the cached chroma. Pass a tiny dummy so the shared
-            # spectral call inside doesn't run on a cache hit.
-            import numpy as _np
-            y_for_call = y if y is not None else _np.zeros(1, dtype=_np.float32)
-            result = _detect_bpm_and_offset(
-                y_for_call, sr, arr_notes, tuning, is_keys,
+                                     offset=load_offset, duration=load_dur)
+                audio_chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=512)
+                cache[okey] = {"y": y, "sr": sr, "chroma": audio_chroma}
+
+            return _detect_bpm_and_offset(
+                y, sr, arr_notes, tuning, is_keys,
                 manual_bpm=manual_bpm, tab_bpm=tab_bpm,
-                audio_chroma=audio_chroma)
-            # Prefer the cached/real BPM over whatever the dummy-y beat_track
-            # produced on a cache hit.
-            if audio_bpm:
-                result["audio_bpm"] = audio_bpm
-            return result
+                audio_chroma=audio_chroma, load_offset=load_offset,
+                audio_bpm=(song_bpm if song_bpm > 0 else None))
 
         try:
             result = await asyncio.get_event_loop().run_in_executor(None, _run)
