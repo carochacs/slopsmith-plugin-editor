@@ -79,6 +79,13 @@ const S = {
     currentArr: 0,
     beats: [], sections: [], duration: 0, offset: 0,
 
+    // Single source of truth for the offset/sync SCOPE ('current' | 'all'),
+    // shared by the toolbar picker and the Sync dialog picker so the two
+    // can't disagree, and persisting across dialog opens (issue #16 — the
+    // old design had two independent, unlinked selects that reset every
+    // open). setOffsetScope() keeps both <select>s mirrored to this.
+    offsetScope: 'current',
+
     // Karaoke lyrics — flat word list [{t, d, w}], only present on sloppak
     // sessions whose manifest already references a lyrics.json (e.g. one
     // produced by TabGrabber). Empty for every other session.
@@ -2625,8 +2632,9 @@ async function loadCDLC(filename) {
         S.cursorTime = 0;
         S.history = new EditHistory();
 
-        // Reset offset UI so _effectiveAudioOffset() doesn't carry over a
-        // delta from a previous session's sync nudge into this one.
+        // Reset offset UI + scope so neither _effectiveAudioOffset() nor the
+        // shared scope carry over from a previous session's sync nudge.
+        setOffsetScope('current');
         _resetOffsetUI();
 
         // Flatten chord notes into main notes array for unified editing
@@ -2810,6 +2818,23 @@ function _resetOffsetUI() {
     const el = document.getElementById('editor-offset');
     if (el) { el.value = '0'; el.dataset.applied = '0'; el.dataset.appliedScope = ''; }
 }
+
+// The one place the offset/sync scope is set. Writes S.offsetScope and
+// mirrors it onto BOTH the toolbar picker and the Sync dialog picker so
+// the two controls always agree (issue #16). Changing the scope resets the
+// offset baseline, since a "this arrangement" delta and an "all
+// arrangements" delta aren't interchangeable.
+function setOffsetScope(scope) {
+    const next = scope === 'all' ? 'all' : 'current';
+    const changed = next !== S.offsetScope;
+    S.offsetScope = next;
+    const toolbarEl = document.getElementById('editor-offset-scope');
+    if (toolbarEl && toolbarEl.value !== next) toolbarEl.value = next;
+    const dialogEl = document.getElementById('sync-scope');
+    if (dialogEl && dialogEl.value !== next) dialogEl.value = next;
+    if (changed) _resetOffsetUI();
+}
+function getOffsetScope() { return S.offsetScope === 'all' ? 'all' : 'current'; }
 
 function _normalizeSongList(raw) {
     // Backend now returns [{filename, format}] objects. Older deployments
@@ -3179,7 +3204,7 @@ window.editorApplyOffset = (val) => {
     const delta = offset - currentOffset;
     if (Math.abs(delta) < 0.0001) return;
 
-    const scopeAll = document.getElementById('editor-offset-scope').value === 'all';
+    const scopeAll = getOffsetScope() === 'all';
     const targetArrangements = scopeAll ? S.arrangements : [S.arrangements[S.currentArr]];
     S.history.exec(new RescaleTimesCmd(() => {
         _scaleAllArrangementTimes(1, delta, targetArrangements);
@@ -3200,11 +3225,17 @@ window.editorApplyOffset = (val) => {
 };
 
 window.editorOffsetScopeChanged = () => {
-    // Switching scope means the field's baseline no longer refers to
-    // anything meaningful (a "this arrangement" nudge and an "all
-    // arrangements" nudge aren't the same delta) — start the nudge
-    // session over rather than silently reusing a stale baseline.
-    _resetOffsetUI();
+    // Toolbar picker changed → update the shared scope (which also mirrors
+    // the dialog picker and resets the nudge baseline, since a "this
+    // arrangement" nudge and an "all arrangements" nudge aren't the same
+    // delta).
+    setOffsetScope(document.getElementById('editor-offset-scope').value);
+};
+
+window.editorSyncScopeChanged = () => {
+    // Dialog picker changed → same shared scope, so the toolbar stays in
+    // lock-step and the choice persists after the dialog closes.
+    setOffsetScope(document.getElementById('sync-scope').value);
 };
 
 // Effective audio offset to send when importing a new arrangement: the
@@ -3247,8 +3278,7 @@ window.editorSelectArrangement = (val) => {
     // leaving, not the new one — reset it so the next nudge computes its
     // delta from zero. An "all arrangements" baseline stays valid (it's
     // song-wide, not tied to S.currentArr).
-    const scopeEl = document.getElementById('editor-offset-scope');
-    if (scopeEl && scopeEl.value !== 'all') _resetOffsetUI();
+    if (getOffsetScope() !== 'all') _resetOffsetUI();
     draw();
     updateStatus();
     refreshChordAnalysis(); // key/chords are per-arrangement — not awaited
@@ -3287,9 +3317,9 @@ window.editorGoBack = () => {
 
 let syncState = { tabBPM: 0, audioBPM: 0 };
 
-// Spectral-flux onset envelope, shared by BPM detection (autocorrelation,
-// below) and offset detection (cross-correlation against note onsets, see
-// detectAudioOffset). Returns null when there's no audio loaded.
+// Spectral-flux onset envelope used by the client-side BPM estimate
+// (autocorrelation, below) shown instantly while the server's chroma/DTW
+// detection runs. Returns null when there's no audio loaded.
 function computeOnsetEnvelope() {
     if (!S.audioBuffer) return null;
     const data = S.audioBuffer.getChannelData(0);
@@ -3417,52 +3447,117 @@ function getTabBPM() {
     return 60 / avg;
 }
 
-// How far in either direction to search for an alignment offset. Bounded
-// so the cross-correlation below stays cheap and doesn't match on
-// implausibly large drift.
-const SYNC_OFFSET_SEARCH_SECONDS = 2.5;
+// Confidence below this is treated as a (verifiable) mismatch: the Apply
+// button then requires an explicit confirmation, and the badge switches to
+// its "verify this" styling. Chosen to match the low end of the server's
+// continuous [0,1] chroma/DTW score (issue #16 data-safety item).
+const SYNC_CONFIDENCE_MIN = 0.45;
 
-// Suggests a starting offset for the Sync dialog by cross-correlating one
-// arrangement's note onsets against the audio's onset envelope — the same
-// signal detectAudioBPM() already computes for tempo, just used for
-// alignment instead. Deliberately scoped to a single arrangement (the one
-// passed in, normally the active one) rather than pooling every
-// arrangement's notes together: different arrangements can have drifted
-// by different amounts (e.g. imported/transcribed at different times), so
-// mixing them would muddy the correlation. Returns 0 when there's nothing
-// to correlate against.
-function detectAudioOffset(arr) {
-    if (!arr || !arr.notes || !arr.notes.length) return 0;
-    const env = computeOnsetEnvelope();
-    if (!env || !env.onset.length) return 0;
-    const { onset, hopSize, sr } = env;
-    const frameDur = hopSize / sr;
+// Latest server detection for the open Sync dialog. `confidence` is the
+// continuous [0,1] chroma/DTW score; `unverifiable` marks cases where a
+// pitch check can't be run at all (no notes, no audio, drum arrangement)
+// — distinct from a real "the audio doesn't match" mismatch.
+let syncDetect = { confidence: null, unverifiable: false, reason: '', pending: false };
+let _syncDetectSeq = 0;      // guards against out-of-order async responses
+let _syncManualBpmTimer = null;
 
-    // Sparse, deduped list of note-onset frames — cheaper to correlate
-    // than building a dense zero-filled array spanning the whole song.
-    const noteFrames = [...new Set(
-        arr.notes.map(n => Math.round((n.time || 0) / frameDur))
-    )].filter(f => f >= 0 && f < onset.length);
-    if (!noteFrames.length) return 0;
-
-    const maxLagFrames = Math.round(SYNC_OFFSET_SEARCH_SECONDS / frameDur);
-    let bestLag = 0;
-    let bestScore = -Infinity;
-    for (let lag = -maxLagFrames; lag <= maxLagFrames; lag++) {
-        let score = 0;
-        for (const f of noteFrames) {
-            const j = f + lag;
-            if (j >= 0 && j < onset.length) score += onset[j];
+// Ask the server (chroma + DTW, librosa) for BPM and a tempo-corrected
+// offset suggestion. Read-only on the server — no session/disk writes.
+// Not awaited by callers: the dialog is usable immediately and fills in
+// when the result lands. Superseded requests (arrangement switch, manual
+// BPM edit) are dropped via the sequence guard.
+async function detectSyncFromServer() {
+    if (!S.sessionId || !S.arrangements.length) return;
+    const arr = S.arrangements[S.currentArr];
+    const manualBpm = parseFloat(document.getElementById('sync-manual-bpm').value);
+    const seq = ++_syncDetectSeq;
+    syncDetect = { confidence: null, unverifiable: false, reason: '', pending: true };
+    _renderSyncConfidence();
+    try {
+        const resp = await fetch('/api/plugins/editor/detect-sync-offset', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                session_id: S.sessionId,
+                tab_bpm: syncState.tabBPM,
+                manual_bpm: manualBpm > 0 ? manualBpm : undefined,
+                arrangement: {
+                    name: arr.name,
+                    tuning: arr.tuning,
+                    notes: notes(),
+                },
+            }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (seq !== _syncDetectSeq) return; // a newer request already fired
+        if (!resp.ok || data.error) {
+            syncDetect = { confidence: null, unverifiable: true,
+                           reason: data.error || 'detection failed', pending: false };
+            _renderSyncConfidence();
+            return;
         }
-        if (score > bestScore) {
-            bestScore = score;
-            bestLag = lag;
+        // Server BPM wins (BPM detection moved server-side per issue #16);
+        // keep the client estimate only when the user set a manual override.
+        if (data.audio_bpm && data.audio_bpm > 0 && !(manualBpm > 0)) {
+            syncState.audioBPM = data.audio_bpm;
+        }
+        syncDetect = {
+            confidence: (typeof data.confidence === 'number') ? data.confidence : null,
+            unverifiable: !!data.unverifiable,
+            reason: data.reason || '',
+            pending: false,
+        };
+        const offsetInput = document.getElementById('sync-offset');
+        if (typeof data.offset_seconds === 'number' && isFinite(data.offset_seconds)) {
+            offsetInput.value = data.offset_seconds.toFixed(3);
+            document.getElementById('sync-offset-tag').textContent = '(auto)';
+        }
+        editorSyncUpdateFactor();
+        _renderSyncConfidence();
+    } catch (e) {
+        if (seq !== _syncDetectSeq) return;
+        syncDetect = { confidence: null, unverifiable: true,
+                       reason: 'detection unavailable', pending: false };
+        _renderSyncConfidence();
+    }
+}
+
+// Paint the confidence badge and toggle the low-confidence Apply gate.
+// Three distinct states (issue #16): "unverifiable" (no pitch check was
+// possible) reads differently from a low-confidence "verify" (a real
+// mismatch), which reads differently from a "good" match.
+function _renderSyncConfidence() {
+    const badge = document.getElementById('sync-confidence');
+    const lowRow = document.getElementById('sync-lowconf-row');
+    const confirmBox = document.getElementById('sync-confirm-lowconf');
+    if (!badge) return;
+    const d = syncDetect;
+    let low = false;
+    if (d.pending) {
+        badge.textContent = 'checking…';
+        badge.className = 'text-gray-500';
+    } else if (d.unverifiable) {
+        badge.textContent = d.reason ? `can't verify — ${d.reason}` : "can't verify";
+        badge.className = 'text-gray-400';
+    } else if (d.confidence === null) {
+        badge.textContent = '—';
+        badge.className = 'text-gray-500';
+    } else {
+        const pct = Math.round(d.confidence * 100);
+        if (d.confidence >= SYNC_CONFIDENCE_MIN) {
+            badge.textContent = `good (${pct}%)`;
+            badge.className = 'text-green-400';
+        } else {
+            badge.textContent = `low — verify (${pct}%)`;
+            badge.className = 'text-amber-400';
+            low = true;
         }
     }
-    // No positive-energy alignment found anywhere in the search window —
-    // don't suggest a lag driven by noise.
-    if (bestScore <= 0) return 0;
-    return bestLag * frameDur;
+    if (lowRow) {
+        lowRow.classList.toggle('hidden', !low);
+        lowRow.classList.toggle('flex', low);
+    }
+    if (!low && confirmBox) confirmBox.checked = false;
 }
 
 window.editorSyncTempo = () => {
@@ -3471,28 +3566,24 @@ window.editorSyncTempo = () => {
         return;
     }
 
-    setStatus('Detecting audio BPM...');
     syncState.tabBPM = getTabBPM();
+    // Client BPM is a placeholder shown instantly; the server's value
+    // replaces it when detectSyncFromServer() returns.
     syncState.audioBPM = detectAudioBPM();
 
     document.getElementById('sync-tab-bpm').textContent = syncState.tabBPM.toFixed(1);
     document.getElementById('sync-audio-bpm').textContent = syncState.audioBPM.toFixed(1);
     document.getElementById('sync-manual-bpm').value = '';
+    document.getElementById('sync-offset').value = '0';
+    document.getElementById('sync-offset-tag').textContent = '';
 
-    // Suggest a starting offset from the active arrangement's note onsets
-    // instead of leaving the field at 0 — same "(auto)" convention as the
-    // manual-BPM-override tag below. Any edit to the field clears the tag.
-    const suggestedOffset = detectAudioOffset(S.arrangements[S.currentArr]);
-    const offsetInput = document.getElementById('sync-offset');
-    offsetInput.value = suggestedOffset.toFixed(3);
-    document.getElementById('sync-offset-tag').textContent = '(auto)';
+    // Scope persists across dialog opens — mirror the shared scope onto the
+    // dialog picker instead of resetting it to 'current' (issue #16).
+    setOffsetScope(getOffsetScope());
 
-    // Scope defaults to "this arrangement only" — matches the detection
-    // above, which only looked at this arrangement's notes, so what's
-    // previewed is what gets applied unless the user opts into "all".
-    document.getElementById('sync-scope').value = 'current';
-
+    syncDetect = { confidence: null, unverifiable: false, reason: '', pending: false };
     editorSyncUpdateFactor();
+    _renderSyncConfidence();
 
     const dlg = document.getElementById('editor-sync-dialog');
     const btn = document.getElementById('editor-sync-btn');
@@ -3500,11 +3591,23 @@ window.editorSyncTempo = () => {
     dlg.style.left = rect.left + 'px';
     dlg.style.top = (rect.bottom + 4) + 'px';
     dlg.classList.remove('hidden');
+
+    // Kick off server-side chroma/DTW detection (BPM + offset).
+    detectSyncFromServer();
     setStatus('Ready');
 };
 
 window.editorSyncOffsetEdited = () => {
     document.getElementById('sync-offset-tag').textContent = '';
+};
+
+// Manual BPM edited: update the factor immediately, then re-run detection
+// (debounced) so the offset is recomputed against the new tempo-corrected
+// timeline rather than the old one.
+window.editorSyncManualBpmEdited = () => {
+    editorSyncUpdateFactor();
+    if (_syncManualBpmTimer) clearTimeout(_syncManualBpmTimer);
+    _syncManualBpmTimer = setTimeout(() => { detectSyncFromServer(); }, 400);
 };
 
 window.editorSyncUpdateFactor = () => {
@@ -3531,22 +3634,33 @@ window.editorApplySync = () => {
 
     if (factor <= 0 || !isFinite(factor)) return;
 
-    const scopeAll = document.getElementById('sync-scope').value === 'all';
+    // Low-confidence gate: a verifiable mismatch must be explicitly
+    // confirmed before it applies — a bad auto-suggestion shouldn't apply
+    // as easily as a good one (issue #16). "Unverifiable" cases (drums, no
+    // audio) are NOT gated — there's no mismatch to warn about.
+    const d = syncDetect;
+    const lowConf = !d.unverifiable && d.confidence !== null && d.confidence < SYNC_CONFIDENCE_MIN;
+    if (lowConf && !document.getElementById('sync-confirm-lowconf').checked) {
+        _renderSyncConfidence();
+        setStatus('Low-confidence match — tick the confirm box to apply, or edit the offset first');
+        return;
+    }
+
+    const scopeAll = getOffsetScope() === 'all';
     const targetArrangements = scopeAll ? S.arrangements : [S.arrangements[S.currentArr]];
 
-    // Scale note times and sustains across the chosen scope only.
-    _scaleAllArrangementTimes(factor, offset, targetArrangements);
-
-    // The shared beat/section grid only moves when every arrangement is
-    // being resynced together — see _scaleAllArrangementTimes' comment.
-    if (scopeAll) {
-        for (const b of S.beats) {
-            b.time = b.time / factor + offset;
+    // Apply through the undo system so Ctrl+Z reverts a bad sync instantly.
+    // In-memory only — nothing reaches disk until an explicit Save.
+    S.history.exec(new RescaleTimesCmd(() => {
+        // Scale note times and sustains across the chosen scope only.
+        _scaleAllArrangementTimes(factor, offset, targetArrangements);
+        // The shared beat/section grid only moves when every arrangement is
+        // being resynced together — see _scaleAllArrangementTimes' comment.
+        if (scopeAll) {
+            for (const b of S.beats) b.time = b.time / factor + offset;
+            for (const s of S.sections) s.start_time = s.start_time / factor + offset;
         }
-        for (const s of S.sections) {
-            s.start_time = s.start_time / factor + offset;
-        }
-    }
+    }));
 
     editorHideSyncDialog();
     draw();
@@ -3959,8 +4073,9 @@ window.editorDoCreate = async () => {
         S.lyricsDirty = false;
         _lyricNowIdx = -1;
 
-        // Reset offset UI so _effectiveAudioOffset() doesn't carry over a
-        // delta from a previous session's sync nudge.
+        // Reset offset UI + scope so neither _effectiveAudioOffset() nor the
+        // shared scope carry over from a previous session's sync nudge.
+        setOffsetScope('current');
         _resetOffsetUI();
 
         flattenChords();

@@ -309,11 +309,12 @@
         <div class="flex justify-between"><span class="text-gray-500">Tab BPM:</span><span id="sync-tab-bpm" class="text-gray-300">—</span></div>
         <div class="flex justify-between"><span class="text-gray-500">Audio BPM:</span><span id="sync-audio-bpm" class="text-gray-300">—</span></div>
         <div class="flex justify-between"><span class="text-gray-500">Scale factor:</span><span id="sync-factor" class="text-white font-mono">—</span></div>
+        <div class="flex justify-between items-center"><span class="text-gray-500">Match:</span><span id="sync-confidence" class="text-gray-500">—</span></div>
         <div>
             <label class="text-gray-500">Manual audio BPM override:</label>
             <input type="number" id="sync-manual-bpm" min="30" max="300" step="0.1" placeholder="auto"
                 class="w-full bg-dark-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 outline-none mt-1"
-                oninput="editorSyncUpdateFactor()">
+                oninput="editorSyncManualBpmEdited()">
         </div>
         <div>
             <label class="text-gray-500">Time offset (seconds): <span id="sync-offset-tag" class="text-gray-600"></span></label>
@@ -323,15 +324,21 @@
         </div>
         <div>
             <label class="text-gray-500">Apply to:</label>
-            <select id="sync-scope"
+            <select id="sync-scope" onchange="editorSyncScopeChanged()"
                 class="w-full bg-dark-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 outline-none mt-1">
                 <option value="current" selected>This arrangement</option>
                 <option value="all">All arrangements</option>
             </select>
         </div>
+        <!-- Shown only when the detected alignment is low-confidence: a bad
+             auto-suggestion must not apply as easily as a good one. -->
+        <label id="sync-lowconf-row" class="hidden items-center gap-2 text-amber-400">
+            <input type="checkbox" id="sync-confirm-lowconf">
+            <span>Low-confidence match — apply this offset anyway?</span>
+        </label>
     </div>
     <div class="flex gap-2 mt-3">
-        <button onclick="editorApplySync()" class="flex-1 px-2 py-1 bg-accent hover:bg-accent-light rounded text-xs">Apply</button>
+        <button id="sync-apply-btn" onclick="editorApplySync()" class="flex-1 px-2 py-1 bg-accent hover:bg-accent-light rounded text-xs">Apply</button>
         <button onclick="editorHideSyncDialog()" class="flex-1 px-2 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs">Cancel</button>
     </div>
 </div>
