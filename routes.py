@@ -1,6 +1,7 @@
 """Arrangement Editor plugin — backend routes."""
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -464,19 +465,90 @@ def setup(app, context):
                     return None
                 return candidate if candidate.exists() else None
 
+            # Cache-file id for this song's audio. The sanitised name alone is
+            # lossy — `foo/bar` vs `foo__bar`, or a space vs an underscore, all
+            # collapse to the same string — so two distinct songs could reuse
+            # each other's `editor_audio_*` file (and, with the mix reuse
+            # below, play the wrong song). Append a digest of the original
+            # filename so distinct sources get distinct ids while the readable
+            # prefix is kept.
+            _safe_name = filename.replace("/", "__").replace("\\", "__").replace(" ", "_")
+            audio_id = f"{_safe_name}_{hashlib.sha256(filename.encode()).hexdigest()[:16]}"
+
+            def _mix_stems_to_full(stems):
+                """Mix every available stem into one full-song ogg so the
+                editor plays the whole song, not one isolated instrument.
+
+                TabGrabber sloppaks ship only Demucs stems (no ``full`` mix),
+                so without this the editor would load the first stem (e.g. an
+                isolated guitar). Demucs stems are an additive decomposition,
+                so ``amix ... normalize=0`` reconstructs ~the original mix
+                without a 1/N attenuation or clipping. Returns the mixed Path,
+                or None when ffmpeg is unavailable / fails (caller then falls
+                back to a single stem). Runs inside the load executor, so the
+                blocking ffmpeg call is off the event loop.
+                """
+                paths = []
+                for s in stems:
+                    p = _safe_stem_path(s)
+                    if p is not None and p.exists():
+                        paths.append(p)
+                if len(paths) < 2:
+                    return None
+                mix_dest = STORAGE_DIR / f"editor_audio_{audio_id}_mix.ogg"
+                # Reuse a prior mix only when it's at least as new as every
+                # source stem. The cache id is keyed on the filename, so a
+                # sloppak replaced/updated at the same path would otherwise
+                # keep serving its old mixed audio (the single-stem path
+                # re-copies every load, so it's immune). Any stem newer than
+                # the mix -> fall through and regenerate.
+                if mix_dest.exists():
+                    try:
+                        mix_mtime = mix_dest.stat().st_mtime
+                        if all(p.stat().st_mtime <= mix_mtime for p in paths):
+                            return mix_dest
+                    except OSError:
+                        pass  # stat failed — regenerate to be safe
+                # Encode to a unique temp file and atomically rename into place
+                # only on success: two concurrent loads of the same song must
+                # never see a half-written mix_dest (a partial OGG the client
+                # can't decode). `ffmpeg` args are a fixed argv list of
+                # sandboxed stem paths (never a shell string), so there's no
+                # command injection despite the manifest-derived filenames.
+                tmp_dest = STORAGE_DIR / f"editor_audio_{audio_id}_mix.{uuid.uuid4().hex}.tmp.ogg"
+                cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+                for p in paths:
+                    cmd += ["-i", str(p)]
+                cmd += ["-filter_complex", f"amix=inputs={len(paths)}:normalize=0",
+                        "-c:a", "libvorbis", "-q:a", "5", str(tmp_dest)]
+                try:
+                    subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+                    os.replace(tmp_dest, mix_dest)  # atomic publish
+                except (OSError, subprocess.SubprocessError) as e:
+                    log.warning("[Editor] stem mix failed (%s); using a single stem", e)
+                    tmp_dest.unlink(missing_ok=True)
+                    return None
+                return mix_dest if mix_dest.exists() else None
+
+            # Prefer an explicit "full" mix stem.
             for s in loaded.stems:
                 if s.get("id") == "full":
                     stem_path = _safe_stem_path(s)
                     break
-            if stem_path is None and loaded.stems:
+            # No "full" stem but several isolated stems -> mix them so the
+            # editor's waveform/playback is the whole song.
+            mixed_path = None
+            if stem_path is None and len(loaded.stems) > 1:
+                mixed_path = _mix_stems_to_full(loaded.stems)
+            # Last resort: the first stem (single-stem sloppak, or ffmpeg
+            # unavailable).
+            if stem_path is None and mixed_path is None and loaded.stems:
                 stem_path = _safe_stem_path(loaded.stems[0])
-            if stem_path and stem_path.exists():
-                # Same basename-collision class as session_id: nested paths
-                # like `foo/bar.psarc` and `baz/bar.sloppak` both reduce
-                # to stem "bar". Use a sanitised full path so two browser
-                # tabs loading distinct songs don't overwrite each other's
-                # `editor_audio_*` file under STATIC_DIR.
-                audio_id = filename.replace("/", "__").replace("\\", "__").replace(" ", "_")
+
+            if mixed_path is not None and mixed_path.exists():
+                audio_url = f"{STORAGE_URL}/{mixed_path.name}"
+                audio_file = str(mixed_path)
+            elif stem_path and stem_path.exists():
                 ext = stem_path.suffix
                 dest = STORAGE_DIR / f"editor_audio_{audio_id}{ext}"
                 shutil.copy2(stem_path, dest)
