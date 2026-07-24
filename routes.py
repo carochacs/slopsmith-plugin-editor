@@ -1,6 +1,7 @@
 """Arrangement Editor plugin — backend routes."""
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -464,11 +465,15 @@ def setup(app, context):
                     return None
                 return candidate if candidate.exists() else None
 
-            # Same basename-collision class as session_id: nested paths like
-            # `foo/bar.psarc` and `baz/bar.sloppak` both reduce to stem "bar".
-            # Use a sanitised full path so two browser tabs loading distinct
-            # songs don't overwrite each other's `editor_audio_*` file.
-            audio_id = filename.replace("/", "__").replace("\\", "__").replace(" ", "_")
+            # Cache-file id for this song's audio. The sanitised name alone is
+            # lossy — `foo/bar` vs `foo__bar`, or a space vs an underscore, all
+            # collapse to the same string — so two distinct songs could reuse
+            # each other's `editor_audio_*` file (and, with the mix reuse
+            # below, play the wrong song). Append a digest of the original
+            # filename so distinct sources get distinct ids while the readable
+            # prefix is kept.
+            _safe_name = filename.replace("/", "__").replace("\\", "__").replace(" ", "_")
+            audio_id = f"{_safe_name}_{hashlib.sha256(filename.encode()).hexdigest()[:16]}"
 
             def _mix_stems_to_full(stems):
                 """Mix every available stem into one full-song ogg so the
@@ -493,16 +498,24 @@ def setup(app, context):
                 mix_dest = STORAGE_DIR / f"editor_audio_{audio_id}_mix.ogg"
                 if mix_dest.exists():
                     return mix_dest  # reuse a prior mix for the same song
+                # Encode to a unique temp file and atomically rename into place
+                # only on success: two concurrent loads of the same song must
+                # never see a half-written mix_dest (a partial OGG the client
+                # can't decode). `ffmpeg` args are a fixed argv list of
+                # sandboxed stem paths (never a shell string), so there's no
+                # command injection despite the manifest-derived filenames.
+                tmp_dest = STORAGE_DIR / f"editor_audio_{audio_id}_mix.{uuid.uuid4().hex}.tmp.ogg"
                 cmd = ["ffmpeg", "-y", "-loglevel", "error"]
                 for p in paths:
                     cmd += ["-i", str(p)]
                 cmd += ["-filter_complex", f"amix=inputs={len(paths)}:normalize=0",
-                        "-c:a", "libvorbis", "-q:a", "5", str(mix_dest)]
+                        "-c:a", "libvorbis", "-q:a", "5", str(tmp_dest)]
                 try:
                     subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+                    os.replace(tmp_dest, mix_dest)  # atomic publish
                 except (OSError, subprocess.SubprocessError) as e:
                     log.warning("[Editor] stem mix failed (%s); using a single stem", e)
-                    mix_dest.unlink(missing_ok=True)
+                    tmp_dest.unlink(missing_ok=True)
                     return None
                 return mix_dest if mix_dest.exists() else None
 
