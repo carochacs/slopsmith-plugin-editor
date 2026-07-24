@@ -432,6 +432,36 @@ function _scaleAllArrangementTimes(factor, offset, arrangements) {
     }
 }
 
+// Guard against a negative over-shift. Under the same rescale
+// _scaleAllArrangementTimes applies (t_new = t/factor + offset), the
+// earliest affected event lands at min(t)/factor + offset; if that would go
+// below 0:00 the offset is raised just enough to put that earliest event at
+// exactly 0, since negative note/beat/section times are meaningless in-game.
+// Returns { offset, clamped } — offset unchanged (clamped:false) when the
+// requested shift is already safe. Pure and self-contained: the caller
+// passes the affected arrangements plus, when the shared grid moves too, the
+// beat/section times as `gridTimes`, so this stays unit-testable without
+// touching module state.
+function _clampOffsetNonNegative(factor, offset, arrangements, gridTimes) {
+    let minSrc = Infinity;
+    for (const arr of (arrangements || [])) {
+        for (const n of (arr.notes || [])) if (n.time < minSrc) minSrc = n.time;
+        for (const ch of (arr.chords || [])) {
+            if (ch.time < minSrc) minSrc = ch.time;
+            for (const cn of (ch.notes || [])) {
+                if (cn.time && cn.time < minSrc) minSrc = cn.time;
+            }
+        }
+    }
+    for (const t of (gridTimes || [])) if (t < minSrc) minSrc = t;
+    if (!isFinite(minSrc)) return { offset, clamped: false };
+    const minResult = minSrc / factor + offset;
+    // Small tolerance so a float that lands a hair below 0 isn't flagged.
+    if (minResult >= -1e-9) return { offset, clamped: false };
+    // Raise the offset so the earliest event lands exactly at 0.
+    return { offset: offset - minResult, clamped: true };
+}
+
 // Reconstruct chords from notes at the same time before saving
 function reconstructChords() {
     if (!S.arrangements.length) return;
@@ -3206,22 +3236,40 @@ window.editorApplyOffset = (val) => {
 
     const scopeAll = getOffsetScope() === 'all';
     const targetArrangements = scopeAll ? S.arrangements : [S.arrangements[S.currentArr]];
+    // Clamp a negative over-shift so nothing lands before 0:00. The nudge is
+    // a delta (t_new = t + delta), so clamp the delta; the effective applied
+    // absolute offset then becomes currentOffset + the clamped delta.
+    const gridTimes = scopeAll
+        ? [...S.beats.map(b => b.time), ...S.sections.map(s => s.start_time)]
+        : [];
+    const clamp = _clampOffsetNonNegative(1, delta, targetArrangements, gridTimes);
+    const appliedDelta = clamp.offset;
+    const appliedAbs = currentOffset + appliedDelta;
     S.history.exec(new RescaleTimesCmd(() => {
-        _scaleAllArrangementTimes(1, delta, targetArrangements);
+        _scaleAllArrangementTimes(1, appliedDelta, targetArrangements);
         // The shared beat/section grid only moves for an all-arrangements
         // nudge — see _scaleAllArrangementTimes' comment.
         if (scopeAll) {
-            for (const b of S.beats) b.time += delta;
-            for (const s of S.sections) s.start_time += delta;
+            for (const b of S.beats) b.time += appliedDelta;
+            for (const s of S.sections) s.start_time += appliedDelta;
         }
-        el.dataset.applied = String(offset);
+        el.dataset.applied = String(appliedAbs);
         el.dataset.appliedScope = scopeAll ? 'all' : 'current';
     }));
+    // Reflect the actually-applied (possibly clamped) offset in the field.
+    el.value = appliedAbs.toFixed(3);
     draw();
-    setStatus(
-        `Offset (${scopeAll ? 'all arrangements' : 'this arrangement'}): ` +
-        `${offset >= 0 ? '+' : ''}${(offset * 1000).toFixed(0)}ms`
-    );
+    if (clamp.clamped) {
+        setStatus(
+            `Offset limited to ${appliedAbs.toFixed(3)}s — a larger negative shift ` +
+            `would move notes before 0:00`
+        );
+    } else {
+        setStatus(
+            `Offset (${scopeAll ? 'all arrangements' : 'this arrangement'}): ` +
+            `${appliedAbs >= 0 ? '+' : ''}${(appliedAbs * 1000).toFixed(0)}ms`
+        );
+    }
 };
 
 window.editorOffsetScopeChanged = () => {
@@ -3649,25 +3697,40 @@ window.editorApplySync = () => {
     const scopeAll = getOffsetScope() === 'all';
     const targetArrangements = scopeAll ? S.arrangements : [S.arrangements[S.currentArr]];
 
+    // Don't let a negative over-shift push notes (or the shared grid, when
+    // scoped to all) before 0:00 — clamp the offset and warn if we had to.
+    const gridTimes = scopeAll
+        ? [...S.beats.map(b => b.time), ...S.sections.map(s => s.start_time)]
+        : [];
+    const clamp = _clampOffsetNonNegative(factor, offset, targetArrangements, gridTimes);
+    const appliedOffset = clamp.offset;
+
     // Apply through the undo system so Ctrl+Z reverts a bad sync instantly.
     // In-memory only — nothing reaches disk until an explicit Save.
     S.history.exec(new RescaleTimesCmd(() => {
         // Scale note times and sustains across the chosen scope only.
-        _scaleAllArrangementTimes(factor, offset, targetArrangements);
+        _scaleAllArrangementTimes(factor, appliedOffset, targetArrangements);
         // The shared beat/section grid only moves when every arrangement is
         // being resynced together — see _scaleAllArrangementTimes' comment.
         if (scopeAll) {
-            for (const b of S.beats) b.time = b.time / factor + offset;
-            for (const s of S.sections) s.start_time = s.start_time / factor + offset;
+            for (const b of S.beats) b.time = b.time / factor + appliedOffset;
+            for (const s of S.sections) s.start_time = s.start_time / factor + appliedOffset;
         }
     }));
 
     editorHideSyncDialog();
     draw();
-    setStatus(
-        `Tempo synced (${scopeAll ? 'all arrangements' : 'this arrangement'}): ` +
-        `scaled ${factor.toFixed(4)}x` + (offset ? `, offset ${offset}s` : '')
-    );
+    if (clamp.clamped) {
+        setStatus(
+            `Offset limited to ${appliedOffset.toFixed(3)}s — a larger negative shift ` +
+            `would move notes before 0:00. Tempo synced ${factor.toFixed(4)}x.`
+        );
+    } else {
+        setStatus(
+            `Tempo synced (${scopeAll ? 'all arrangements' : 'this arrangement'}): ` +
+            `scaled ${factor.toFixed(4)}x` + (appliedOffset ? `, offset ${appliedOffset}s` : '')
+        );
+    }
 };
 
 // ════════════════════════════════════════════════════════════════════
