@@ -65,6 +65,7 @@ the full FastAPI + slopsmith lib.* stack.
 """
 
 import ast
+import json
 import textwrap
 from pathlib import Path
 
@@ -82,9 +83,11 @@ SR = 22050  # librosa's default; keeps synthetic-fixture generation fast
 
 _WANTED = {
     "_select_stem_for_arrangement",
+    "_select_bpm_stem",
     "_note_onset_pitch_classes",
     "_chroma_frames_from_pitch_events",
     "_detect_bpm_and_offset",
+    "_load_disk_arrangement_notes",
 }
 
 
@@ -102,7 +105,7 @@ def _load_helpers():
         n for n in tree.body
         if isinstance(n, ast.FunctionDef) and n.name == "setup"
     )
-    ns = {"np": np, "chord_analysis": ca}
+    ns = {"np": np, "chord_analysis": ca, "json": json, "Path": Path}
     found = set()
     for node in setup_fn.body:
         if isinstance(node, ast.FunctionDef) and node.name in _WANTED:
@@ -134,7 +137,16 @@ def _note(string, fret, time=0.0, sustain=0.3):
 # ── Synthetic audio fixtures ────────────────────────────────────────────────
 
 def _silence(duration_sec, sr=SR):
-    return np.random.uniform(-0.002, 0.002, int(duration_sec * sr)).astype(np.float32)
+    # A fixed local seed, not the global RNG — "silence" is a background
+    # noise floor under a deterministic tone, and several tests assert tight
+    # offset/confidence tolerances against it. Unseeded noise occasionally
+    # correlates enough by chance to flake a real assertion (observed: both
+    # this and a pass-the-threshold-by-luck failure in a verify_windows
+    # test); seeding makes every synthetic fixture reproducible without
+    # touching numpy's global random state (which other tests don't rely on
+    # being unseeded either).
+    rng = np.random.default_rng(20260724)
+    return rng.uniform(-0.002, 0.002, int(duration_sec * sr)).astype(np.float32)
 
 
 def midi_to_freq(midi):
@@ -408,3 +420,218 @@ def test_detect_bpm_and_offset_response_shape(H):
     assert set(result.keys()) >= {"audio_bpm", "offset_seconds", "confidence"}
     assert isinstance(result["confidence"], float)
     assert isinstance(result["offset_seconds"], float)
+
+
+# ── Regression: real-file bugs found on a TabGrabber sloppak (Black — Pearl
+# Jam). Beat tracking octave-errored on the isolated guitar stem (read 152
+# for a 77 BPM song), and the offset search over the whole decoded region
+# locked onto a far-away pitch-class recurrence instead of the real onset.
+
+def test_detect_bpm_and_offset_folds_octave_error_toward_tab_bpm(H):
+    # A 152 BPM click is a clean double of a 76 BPM tab. With the tab tempo
+    # supplied, the reported BPM must land near the tab's octave (≈76), not
+    # the doubled 152 — otherwise the client derives a ~2x factor and halves
+    # the whole chart.
+    y = _click_track(152.0, duration_sec=8.0)
+    notes = [_note(0, 0, time=0.5, sustain=0.2)]
+    result = H["_detect_bpm_and_offset"](
+        y, SR, notes, STD_GUITAR_TUNING, False, tab_bpm=76.0)
+    ratio = result["audio_bpm"] / 76.0
+    assert abs(ratio - 1.0) < 0.1, (
+        f"detected BPM should fold to the tab's octave (~76), got {result['audio_bpm']}"
+    )
+
+
+def test_detect_bpm_and_offset_near_unity_factor_snaps_to_one(H):
+    # Audio and tab at essentially the same tempo: the reported BPM must come
+    # back consistent with a factor of exactly 1 (audio_bpm ≈ tab_bpm), so a
+    # small beat-tracking wobble can't rescale an already-aligned tab.
+    y = _click_track(77.0, duration_sec=8.0)
+    notes = [_note(0, 0, time=0.5, sustain=0.2)]
+    result = H["_detect_bpm_and_offset"](
+        y, SR, notes, STD_GUITAR_TUNING, False, tab_bpm=77.0)
+    assert abs(result["audio_bpm"] / 77.0 - 1.0) < 0.02
+
+
+def test_detect_bpm_and_offset_load_offset_keeps_absolute_timeline(H):
+    # When the route decodes only a local window that begins at `load_offset`
+    # seconds, the returned offset must still be in the tab's absolute
+    # timeline. Here the note sits at absolute 12.0s and the audio window
+    # begins at 10.0s with the matching tone 2.0s into it (= absolute 12.0s),
+    # so the two already coincide and the offset must be ~0 (not the ~-10s a
+    # load-offset-naive implementation would report).
+    load_offset = 10.0
+    tone_in_window = 2.0          # 2s into the decoded window
+    note_abs = load_offset + tone_in_window  # 12.0s absolute
+    y = _silence(6.0)             # represents audio[10.0 .. 16.0]
+    _tone_at(y, tone_in_window, midi_to_freq(64), dur_sec=0.15)
+    notes = [_note(0, 0, time=note_abs, sustain=0.15)]
+    result = H["_detect_bpm_and_offset"](
+        y, SR, notes, STD_GUITAR_TUNING, False, load_offset=load_offset)
+    assert abs(result["offset_seconds"]) < 0.15, (
+        f"offset must be in the absolute timeline via load_offset, got {result['offset_seconds']}"
+    )
+
+
+# ── verify_windows — independent-evidence multi-window verification ────────
+#
+# Regression tests for a real bug found validating against a synced/desynced
+# pair of real files: the opening-window match alone can be confidently
+# WRONG (a correctly-synced guitar stem's opening notes coincidentally
+# matched a spot elsewhere, reporting a spurious offset at confidence 0.89).
+# verify_windows lets the caller supply independent evidence (a later
+# section of the same arrangement, or another arrangement's own notes) that
+# must corroborate the primary window before it's trusted at high
+# confidence. A second real-file regression (a verify window with only
+# confidence 0.21 in ITS OWN alignment was still allowed to veto a correct,
+# confidence-1.00 primary match) is why an unreliable verify window must be
+# excluded from voting entirely, not just weighted down.
+
+def _clean_window(note_time, tone_time, dur=6.0, midi=64, tone_dur=0.15):
+    """A (notes, y) pair where a note at `note_time` has a clean matching
+    tone at `tone_time` in the synthetic audio — a reliable window."""
+    y = _silence(dur)
+    _tone_at(y, tone_time, midi_to_freq(midi), dur_sec=tone_dur)
+    notes = [_note(0, 0, time=note_time, sustain=tone_dur)]
+    return notes, y
+
+
+def test_verify_window_agreement_boosts_confidence(H):
+    # Primary and verify windows both cleanly match at essentially the same
+    # offset (~0) — independent agreement should not lower confidence below
+    # what the primary alone already achieved, and may raise it.
+    p_notes, p_y = _clean_window(note_time=2.0, tone_time=2.0)
+    v_notes, v_y = _clean_window(note_time=3.0, tone_time=3.0)
+    primary_alone = H["_detect_bpm_and_offset"](p_y, SR, p_notes, STD_GUITAR_TUNING, False)
+    result = H["_detect_bpm_and_offset"](
+        p_y, SR, p_notes, STD_GUITAR_TUNING, False,
+        verify_windows=[{"notes": v_notes, "y": v_y, "sr": SR, "chroma": None, "load_offset": 0.0}])
+    assert result["confidence"] >= primary_alone["confidence"] - 1e-6
+    assert abs(result["offset_seconds"]) < 0.15
+
+
+def test_verify_window_own_low_confidence_does_not_veto_strong_primary(H):
+    # The primary window is a clean, confident match. The verify window is
+    # pure silence — it can't confidently determine its own offset, so it
+    # must NOT be allowed to drag the primary's confidence down: a verify
+    # window that doesn't trust its own alignment gets no vote, for or
+    # against. (Regression: this exact case previously dragged a real
+    # confidence-1.00 primary match down to 0.30 on a correctly-detected
+    # desync, because the old logic counted ANY successfully-aligned verify
+    # window toward the "nothing agreed" cap, regardless of its own
+    # confidence.)
+    p_notes, p_y = _clean_window(note_time=2.0, tone_time=2.0)
+    v_notes = [_note(0, 0, time=3.0, sustain=0.2)]
+    # Exact digital silence (not _silence()'s tiny random noise floor) — a
+    # deterministic "no signal at all" fixture, so this test can't flake on
+    # noise that occasionally correlates enough by chance to clear the
+    # reliability threshold.
+    v_y = np.zeros(int(6.0 * SR), dtype=np.float32)
+    primary_alone = H["_detect_bpm_and_offset"](p_y, SR, p_notes, STD_GUITAR_TUNING, False)
+    result = H["_detect_bpm_and_offset"](
+        p_y, SR, p_notes, STD_GUITAR_TUNING, False,
+        verify_windows=[{"notes": v_notes, "y": v_y, "sr": SR, "chroma": None, "load_offset": 0.0}])
+    assert result["confidence"] >= primary_alone["confidence"] - 1e-6, (
+        "an unreliable verify window must not lower a strong primary's confidence"
+    )
+
+
+def test_verify_window_reliable_disagreement_caps_confidence(H):
+    # Both windows cleanly match (each is independently confident), but at
+    # offsets far apart from each other. A real song-wide desync holds
+    # everywhere in the song; two confident, independent windows finding
+    # different offsets means the primary's match was likely coincidental,
+    # not a real alignment — confidence must be capped low regardless of how
+    # clean the primary window's own match looked in isolation.
+    p_notes, p_y = _clean_window(note_time=2.0, tone_time=2.0)          # offset ~0
+    v_notes, v_y = _clean_window(note_time=3.0, tone_time=3.0 + 2.5)    # offset ~+2.5, far from 0
+    result = H["_detect_bpm_and_offset"](
+        p_y, SR, p_notes, STD_GUITAR_TUNING, False,
+        verify_windows=[{"notes": v_notes, "y": v_y, "sr": SR, "chroma": None, "load_offset": 0.0}])
+    assert result["confidence"] <= 0.3 + 1e-6
+
+
+def test_verify_windows_empty_list_behaves_like_no_verification(H):
+    # An empty verify_windows list (e.g. the route couldn't build any) must
+    # be a no-op — same result as not passing verify_windows at all.
+    notes, y = _clean_window(note_time=2.0, tone_time=2.0)
+    r_none = H["_detect_bpm_and_offset"](y, SR, notes, STD_GUITAR_TUNING, False)
+    r_empty = H["_detect_bpm_and_offset"](y, SR, notes, STD_GUITAR_TUNING, False, verify_windows=[])
+    assert r_none["offset_seconds"] == r_empty["offset_seconds"]
+    assert r_none["confidence"] == r_empty["confidence"]
+
+
+# ── _select_bpm_stem ────────────────────────────────────────────────────────
+# Pure, no audio — the stem chosen for BEAT TRACKING (as opposed to
+# _select_stem_for_arrangement, which picks the chroma/offset source).
+
+def test_select_bpm_stem_prefers_drums(H):
+    stems = [
+        {"id": "guitar", "file": "stems/guitar.ogg"},
+        {"id": "drums", "file": "stems/drums.ogg"},
+        {"id": "full", "file": "stems/full.ogg"},
+    ]
+    assert H["_select_bpm_stem"](stems) == "stems/drums.ogg"
+
+
+def test_select_bpm_stem_falls_back_to_full_without_drums(H):
+    stems = [{"id": "guitar", "file": "stems/guitar.ogg"}, {"id": "full", "file": "stems/full.ogg"}]
+    assert H["_select_bpm_stem"](stems) == "stems/full.ogg"
+
+
+def test_select_bpm_stem_falls_back_to_first_stem_when_no_drums_or_full(H):
+    stems = [{"id": "vocals", "file": "stems/vocals.ogg"}, {"id": "guitar", "file": "stems/guitar.ogg"}]
+    assert H["_select_bpm_stem"](stems) == "stems/vocals.ogg"
+
+
+def test_select_bpm_stem_returns_none_for_empty_stem_list(H):
+    assert H["_select_bpm_stem"]([]) is None
+
+
+def test_select_bpm_stem_id_matching_is_case_insensitive(H):
+    stems = [{"id": "Drums", "file": "stems/drums.ogg"}]
+    assert H["_select_bpm_stem"](stems) == "stems/drums.ogg"
+
+
+# ── _load_disk_arrangement_notes ────────────────────────────────────────────
+# Reads an on-disk arrangement JSON (compact t/s/f/sus keys) and normalizes
+# to the wire format. Real file I/O, so these use tmp_path.
+
+def test_load_disk_arrangement_notes_normalizes_compact_keys(H, tmp_path):
+    p = tmp_path / "bass.json"
+    p.write_text(json.dumps({"notes": [{"t": 1.5, "s": 2, "f": 3, "sus": 0.4}]}))
+    notes = H["_load_disk_arrangement_notes"](str(p))
+    assert notes == [{"string": 2, "fret": 3, "time": 1.5, "sustain": 0.4}]
+
+
+def test_load_disk_arrangement_notes_chord_members_inherit_chord_time(H, tmp_path):
+    p = tmp_path / "arr.json"
+    p.write_text(json.dumps({
+        "notes": [],
+        "chords": [{
+            "t": 2.0,
+            "notes": [
+                {"s": 0, "f": 1, "sus": 0.3},           # no own time -> inherits chord's 2.0
+                {"s": 1, "f": 2, "t": 2.5, "sus": 0.2},  # own time -> 2.5
+            ],
+        }],
+    }))
+    times = sorted(n["time"] for n in H["_load_disk_arrangement_notes"](str(p)))
+    assert times == [2.0, 2.5]
+
+
+def test_load_disk_arrangement_notes_output_is_time_sorted(H, tmp_path):
+    p = tmp_path / "arr.json"
+    p.write_text(json.dumps({"notes": [{"t": 5.0, "s": 0, "f": 0}, {"t": 1.0, "s": 0, "f": 0}]}))
+    notes = H["_load_disk_arrangement_notes"](str(p))
+    assert [n["time"] for n in notes] == [1.0, 5.0]
+
+
+def test_load_disk_arrangement_notes_missing_file_returns_empty(H, tmp_path):
+    assert H["_load_disk_arrangement_notes"](str(tmp_path / "nope.json")) == []
+
+
+def test_load_disk_arrangement_notes_malformed_json_returns_empty(H, tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text("{not valid json")
+    assert H["_load_disk_arrangement_notes"](str(p)) == []
