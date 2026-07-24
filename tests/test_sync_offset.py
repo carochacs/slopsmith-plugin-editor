@@ -459,3 +459,91 @@ def test_detect_bpm_and_offset_load_offset_keeps_absolute_timeline(H):
     assert abs(result["offset_seconds"]) < 0.15, (
         f"offset must be in the absolute timeline via load_offset, got {result['offset_seconds']}"
     )
+
+
+# ── verify_windows — independent-evidence multi-window verification ────────
+#
+# Regression tests for a real bug found validating against a synced/desynced
+# pair of real files: the opening-window match alone can be confidently
+# WRONG (a correctly-synced guitar stem's opening notes coincidentally
+# matched a spot elsewhere, reporting a spurious offset at confidence 0.89).
+# verify_windows lets the caller supply independent evidence (a later
+# section of the same arrangement, or another arrangement's own notes) that
+# must corroborate the primary window before it's trusted at high
+# confidence. A second real-file regression (a verify window with only
+# confidence 0.21 in ITS OWN alignment was still allowed to veto a correct,
+# confidence-1.00 primary match) is why an unreliable verify window must be
+# excluded from voting entirely, not just weighted down.
+
+def _clean_window(note_time, tone_time, dur=6.0, midi=64, tone_dur=0.15):
+    """A (notes, y) pair where a note at `note_time` has a clean matching
+    tone at `tone_time` in the synthetic audio — a reliable window."""
+    y = _silence(dur)
+    _tone_at(y, tone_time, midi_to_freq(midi), dur_sec=tone_dur)
+    notes = [_note(0, 0, time=note_time, sustain=tone_dur)]
+    return notes, y
+
+
+def test_verify_window_agreement_boosts_confidence(H):
+    # Primary and verify windows both cleanly match at essentially the same
+    # offset (~0) — independent agreement should not lower confidence below
+    # what the primary alone already achieved, and may raise it.
+    p_notes, p_y = _clean_window(note_time=2.0, tone_time=2.0)
+    v_notes, v_y = _clean_window(note_time=3.0, tone_time=3.0)
+    primary_alone = H["_detect_bpm_and_offset"](p_y, SR, p_notes, STD_GUITAR_TUNING, False)
+    result = H["_detect_bpm_and_offset"](
+        p_y, SR, p_notes, STD_GUITAR_TUNING, False,
+        verify_windows=[{"notes": v_notes, "y": v_y, "sr": SR, "chroma": None, "load_offset": 0.0}])
+    assert result["confidence"] >= primary_alone["confidence"] - 1e-6
+    assert abs(result["offset_seconds"]) < 0.15
+
+
+def test_verify_window_own_low_confidence_does_not_veto_strong_primary(H):
+    # The primary window is a clean, confident match. The verify window is
+    # pure silence — it can't confidently determine its own offset, so it
+    # must NOT be allowed to drag the primary's confidence down: a verify
+    # window that doesn't trust its own alignment gets no vote, for or
+    # against. (Regression: this exact case previously dragged a real
+    # confidence-1.00 primary match down to 0.30 on a correctly-detected
+    # desync, because the old logic counted ANY successfully-aligned verify
+    # window toward the "nothing agreed" cap, regardless of its own
+    # confidence.)
+    p_notes, p_y = _clean_window(note_time=2.0, tone_time=2.0)
+    v_notes = [_note(0, 0, time=3.0, sustain=0.2)]
+    # Exact digital silence (not _silence()'s tiny random noise floor) — a
+    # deterministic "no signal at all" fixture, so this test can't flake on
+    # noise that occasionally correlates enough by chance to clear the
+    # reliability threshold.
+    v_y = np.zeros(int(6.0 * SR), dtype=np.float32)
+    primary_alone = H["_detect_bpm_and_offset"](p_y, SR, p_notes, STD_GUITAR_TUNING, False)
+    result = H["_detect_bpm_and_offset"](
+        p_y, SR, p_notes, STD_GUITAR_TUNING, False,
+        verify_windows=[{"notes": v_notes, "y": v_y, "sr": SR, "chroma": None, "load_offset": 0.0}])
+    assert result["confidence"] >= primary_alone["confidence"] - 1e-6, (
+        "an unreliable verify window must not lower a strong primary's confidence"
+    )
+
+
+def test_verify_window_reliable_disagreement_caps_confidence(H):
+    # Both windows cleanly match (each is independently confident), but at
+    # offsets far apart from each other. A real song-wide desync holds
+    # everywhere in the song; two confident, independent windows finding
+    # different offsets means the primary's match was likely coincidental,
+    # not a real alignment — confidence must be capped low regardless of how
+    # clean the primary window's own match looked in isolation.
+    p_notes, p_y = _clean_window(note_time=2.0, tone_time=2.0)          # offset ~0
+    v_notes, v_y = _clean_window(note_time=3.0, tone_time=3.0 + 2.5)    # offset ~+2.5, far from 0
+    result = H["_detect_bpm_and_offset"](
+        p_y, SR, p_notes, STD_GUITAR_TUNING, False,
+        verify_windows=[{"notes": v_notes, "y": v_y, "sr": SR, "chroma": None, "load_offset": 0.0}])
+    assert result["confidence"] <= 0.3 + 1e-6
+
+
+def test_verify_windows_empty_list_behaves_like_no_verification(H):
+    # An empty verify_windows list (e.g. the route couldn't build any) must
+    # be a no-op — same result as not passing verify_windows at all.
+    notes, y = _clean_window(note_time=2.0, tone_time=2.0)
+    r_none = H["_detect_bpm_and_offset"](y, SR, notes, STD_GUITAR_TUNING, False)
+    r_empty = H["_detect_bpm_and_offset"](y, SR, notes, STD_GUITAR_TUNING, False, verify_windows=[])
+    assert r_none["offset_seconds"] == r_empty["offset_seconds"]
+    assert r_none["confidence"] == r_empty["confidence"]
