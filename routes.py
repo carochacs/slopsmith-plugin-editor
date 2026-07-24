@@ -496,8 +496,19 @@ def setup(app, context):
                 if len(paths) < 2:
                     return None
                 mix_dest = STORAGE_DIR / f"editor_audio_{audio_id}_mix.ogg"
+                # Reuse a prior mix only when it's at least as new as every
+                # source stem. The cache id is keyed on the filename, so a
+                # sloppak replaced/updated at the same path would otherwise
+                # keep serving its old mixed audio (the single-stem path
+                # re-copies every load, so it's immune). Any stem newer than
+                # the mix -> fall through and regenerate.
                 if mix_dest.exists():
-                    return mix_dest  # reuse a prior mix for the same song
+                    try:
+                        mix_mtime = mix_dest.stat().st_mtime
+                        if all(p.stat().st_mtime <= mix_mtime for p in paths):
+                            return mix_dest
+                    except OSError:
+                        pass  # stat failed — regenerate to be safe
                 # Encode to a unique temp file and atomically rename into place
                 # only on success: two concurrent loads of the same song must
                 # never see a half-written mix_dest (a partial OGG the client
