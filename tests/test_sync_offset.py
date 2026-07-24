@@ -408,3 +408,54 @@ def test_detect_bpm_and_offset_response_shape(H):
     assert set(result.keys()) >= {"audio_bpm", "offset_seconds", "confidence"}
     assert isinstance(result["confidence"], float)
     assert isinstance(result["offset_seconds"], float)
+
+
+# ── Regression: real-file bugs found on a TabGrabber sloppak (Black — Pearl
+# Jam). Beat tracking octave-errored on the isolated guitar stem (read 152
+# for a 77 BPM song), and the offset search over the whole decoded region
+# locked onto a far-away pitch-class recurrence instead of the real onset.
+
+def test_detect_bpm_and_offset_folds_octave_error_toward_tab_bpm(H):
+    # A 152 BPM click is a clean double of a 76 BPM tab. With the tab tempo
+    # supplied, the reported BPM must land near the tab's octave (≈76), not
+    # the doubled 152 — otherwise the client derives a ~2x factor and halves
+    # the whole chart.
+    y = _click_track(152.0, duration_sec=8.0)
+    notes = [_note(0, 0, time=0.5, sustain=0.2)]
+    result = H["_detect_bpm_and_offset"](
+        y, SR, notes, STD_GUITAR_TUNING, False, tab_bpm=76.0)
+    ratio = result["audio_bpm"] / 76.0
+    assert abs(ratio - 1.0) < 0.1, (
+        f"detected BPM should fold to the tab's octave (~76), got {result['audio_bpm']}"
+    )
+
+
+def test_detect_bpm_and_offset_near_unity_factor_snaps_to_one(H):
+    # Audio and tab at essentially the same tempo: the reported BPM must come
+    # back consistent with a factor of exactly 1 (audio_bpm ≈ tab_bpm), so a
+    # small beat-tracking wobble can't rescale an already-aligned tab.
+    y = _click_track(77.0, duration_sec=8.0)
+    notes = [_note(0, 0, time=0.5, sustain=0.2)]
+    result = H["_detect_bpm_and_offset"](
+        y, SR, notes, STD_GUITAR_TUNING, False, tab_bpm=77.0)
+    assert abs(result["audio_bpm"] / 77.0 - 1.0) < 0.02
+
+
+def test_detect_bpm_and_offset_load_offset_keeps_absolute_timeline(H):
+    # When the route decodes only a local window that begins at `load_offset`
+    # seconds, the returned offset must still be in the tab's absolute
+    # timeline. Here the note sits at absolute 12.0s and the audio window
+    # begins at 10.0s with the matching tone 2.0s into it (= absolute 12.0s),
+    # so the two already coincide and the offset must be ~0 (not the ~-10s a
+    # load-offset-naive implementation would report).
+    load_offset = 10.0
+    tone_in_window = 2.0          # 2s into the decoded window
+    note_abs = load_offset + tone_in_window  # 12.0s absolute
+    y = _silence(6.0)             # represents audio[10.0 .. 16.0]
+    _tone_at(y, tone_in_window, midi_to_freq(64), dur_sec=0.15)
+    notes = [_note(0, 0, time=note_abs, sustain=0.15)]
+    result = H["_detect_bpm_and_offset"](
+        y, SR, notes, STD_GUITAR_TUNING, False, load_offset=load_offset)
+    assert abs(result["offset_seconds"]) < 0.15, (
+        f"offset must be in the absolute timeline via load_offset, got {result['offset_seconds']}"
+    )
