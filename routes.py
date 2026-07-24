@@ -3110,6 +3110,15 @@ def setup(app, context):
             out so multiple independent windows can be checked for agreement
             without duplicating the chroma-build/DTW/confidence logic.
             """
+            # Derived from this window's OWN sample rate, not the outer
+            # hop_seconds (the primary window's) — chroma_w and
+            # frames_to_time below are already keyed on sr_w, and the
+            # symbolic grid must describe the same time axis or the pattern
+            # comes out stretched relative to the audio, in the one function
+            # whose entire job is deciding whether an offset is trustworthy.
+            # Every caller today decodes at a fixed sr=22050, so sr_w == the
+            # outer sr in practice; this just removes the latent trap.
+            hop_seconds_w = hop / float(sr_w) if sr_w else hop_seconds
             events_w = _note_onset_pitch_classes(notes_w, tuning, is_keys, ca_mod)
             if not events_w:
                 return None, 0.0
@@ -3118,13 +3127,13 @@ def setup(app, context):
             expanded_w = []
             for t, pc, w in corrected_w:
                 rel = t - first_w
-                dur = min(max(float(w), hop_seconds), max_note_fill_sec)
-                n_span = max(1, int(round(dur / hop_seconds)))
+                dur = min(max(float(w), hop_seconds_w), max_note_fill_sec)
+                n_span = max(1, round(dur / hop_seconds_w))
                 for k in range(n_span):
-                    expanded_w.append((rel + k * hop_seconds, pc, 1.0))
+                    expanded_w.append((rel + k * hop_seconds_w, pc, 1.0))
             max_rel_w = max(t for t, _, _ in expanded_w)
-            n_frames_w = int(round(max_rel_w / hop_seconds)) + 1
-            sym_w = _chroma_frames_from_pitch_events(expanded_w, hop_seconds, n_frames_w)
+            n_frames_w = round(max_rel_w / hop_seconds_w) + 1
+            sym_w = _chroma_frames_from_pitch_events(expanded_w, hop_seconds_w, n_frames_w)
             sym_w = sym_w + 1e-6  # keep every column non-zero for the cosine metric
 
             try:
@@ -3152,30 +3161,21 @@ def setup(app, context):
             # wp is returned end->start; wp[-1] = (symbolic frame 0, audio
             # frame). Add load_offset so the result is in the tab's absolute
             # timeline even when only a local window was decoded.
+            #
+            # No onset-refinement snap here. It was tried (snap the DTW
+            # result to the nearest detected onset within a tolerance) but
+            # removed after validation showed it unreliable: when two real
+            # onsets straddle the DTW point at nearly equal distance (e.g. a
+            # true note onset and an incidental noise-driven onset), "nearest
+            # to the raw DTW point" is an effectively arbitrary tie-break —
+            # confirmed on a clean synthetic case where it flipped a correct
+            # 0.067s result to a wrong 0.136s one by picking the far side of
+            # the tie. The measured real-file benefit was already marginal
+            # (~0.02s), so the raw DTW result is kept: simpler and without
+            # this failure mode.
             audio_start_frame_w = int(wp_w[-1][1])
             audio_start_time_w = float(load_offset_w) + float(
                 librosa.frames_to_time(audio_start_frame_w, sr=sr_w, hop_length=hop))
-
-            # Onset-refinement: chroma finds the right pitch-class REGION,
-            # not a sharp attack instant — temporal precision scales with
-            # note sustain/tone duration, not frame resolution (issue #16).
-            # If a real onset falls within a small tolerance of the DTW
-            # result, snap to it; validated to tighten a real desynced
-            # file's bass-anchor offset without disturbing already-accurate
-            # matches (the snap only fires when an onset is genuinely close).
-            try:
-                if y_w is not None and len(y_w):
-                    onset_frames = librosa.onset.onset_detect(
-                        y=y_w, sr=sr_w, hop_length=hop, backtrack=True, units="frames")
-                    if len(onset_frames):
-                        onset_times = float(load_offset_w) + librosa.frames_to_time(
-                            onset_frames, sr=sr_w, hop_length=hop)
-                        near = onset_times[np.abs(onset_times - audio_start_time_w) <= 0.35]
-                        if len(near):
-                            audio_start_time_w = float(
-                                near[np.argmin(np.abs(near - audio_start_time_w))])
-            except Exception:
-                pass
 
             offset_w = float(audio_start_time_w - first_w)
 
@@ -3391,8 +3391,8 @@ def setup(app, context):
                     ly, lsr, lchroma, lload = _load_local_window(audio_path, lt0)
                     verify_windows.append({"notes": cluster, "y": ly, "sr": lsr,
                                            "chroma": lchroma, "load_offset": lload})
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("[Editor] sync verify: later-section window unavailable: %s", e)
 
             # (b) Cross-arrangement: the Bass arrangement's own opening notes
             # against the bass stem, when this request isn't already Bass.
@@ -3408,14 +3408,25 @@ def setup(app, context):
                         bass_json = _resolve_sandboxed_path(session_dir, bass_entry["file"])
                         if bass_json is not None and bass_json.exists():
                             bass_notes = _load_disk_arrangement_notes(bass_json)
-                            if bass_notes:
-                                bass_audio_path = audio_path
-                                if stems:
-                                    brel2 = _select_stem_for_arrangement(stems, "Bass")
-                                    if brel2:
-                                        bcand2 = _resolve_sandboxed_path(session_dir, brel2)
-                                        if bcand2 is not None and bcand2.exists():
-                                            bass_audio_path = str(bcand2)
+                            # A genuinely distinct bass stem is required — if
+                            # none resolves, falling back to the primary
+                            # arrangement's own audio would mean checking the
+                            # Bass arrangement's notes against (e.g.) the
+                            # guitar stem: not independent evidence, just the
+                            # same audio the primary window already used with
+                            # different notes. A coincidental self-match there
+                            # would inflate confidence on exactly the failure
+                            # mode this mechanism exists to catch, so skipping
+                            # the window is the honest outcome.
+                            bass_audio_path = None
+                            if bass_notes and stems:
+                                brel2 = _select_stem_for_arrangement(stems, "Bass")
+                                if brel2:
+                                    bcand2 = _resolve_sandboxed_path(session_dir, brel2)
+                                    if (bcand2 is not None and bcand2.exists()
+                                            and str(bcand2) != audio_path):
+                                        bass_audio_path = str(bcand2)
+                            if bass_notes and bass_audio_path:
                                 bt0 = min(float(n.get("time", 0.0) or 0.0) for n in bass_notes)
                                 bcluster = [
                                     n for n in bass_notes
@@ -3424,8 +3435,8 @@ def setup(app, context):
                                 by, bsr, bchroma, bload = _load_local_window(bass_audio_path, bt0)
                                 verify_windows.append({"notes": bcluster, "y": by, "sr": bsr,
                                                        "chroma": bchroma, "load_offset": bload})
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("[Editor] sync verify: bass cross-arrangement window unavailable: %s", e)
 
             return _detect_bpm_and_offset(
                 y, sr, arr_notes, tuning, is_keys,

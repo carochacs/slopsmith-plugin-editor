@@ -65,6 +65,7 @@ the full FastAPI + slopsmith lib.* stack.
 """
 
 import ast
+import json
 import textwrap
 from pathlib import Path
 
@@ -82,9 +83,11 @@ SR = 22050  # librosa's default; keeps synthetic-fixture generation fast
 
 _WANTED = {
     "_select_stem_for_arrangement",
+    "_select_bpm_stem",
     "_note_onset_pitch_classes",
     "_chroma_frames_from_pitch_events",
     "_detect_bpm_and_offset",
+    "_load_disk_arrangement_notes",
 }
 
 
@@ -102,7 +105,7 @@ def _load_helpers():
         n for n in tree.body
         if isinstance(n, ast.FunctionDef) and n.name == "setup"
     )
-    ns = {"np": np, "chord_analysis": ca}
+    ns = {"np": np, "chord_analysis": ca, "json": json, "Path": Path}
     found = set()
     for node in setup_fn.body:
         if isinstance(node, ast.FunctionDef) and node.name in _WANTED:
@@ -134,7 +137,16 @@ def _note(string, fret, time=0.0, sustain=0.3):
 # ── Synthetic audio fixtures ────────────────────────────────────────────────
 
 def _silence(duration_sec, sr=SR):
-    return np.random.uniform(-0.002, 0.002, int(duration_sec * sr)).astype(np.float32)
+    # A fixed local seed, not the global RNG — "silence" is a background
+    # noise floor under a deterministic tone, and several tests assert tight
+    # offset/confidence tolerances against it. Unseeded noise occasionally
+    # correlates enough by chance to flake a real assertion (observed: both
+    # this and a pass-the-threshold-by-luck failure in a verify_windows
+    # test); seeding makes every synthetic fixture reproducible without
+    # touching numpy's global random state (which other tests don't rely on
+    # being unseeded either).
+    rng = np.random.default_rng(20260724)
+    return rng.uniform(-0.002, 0.002, int(duration_sec * sr)).astype(np.float32)
 
 
 def midi_to_freq(midi):
@@ -547,3 +559,79 @@ def test_verify_windows_empty_list_behaves_like_no_verification(H):
     r_empty = H["_detect_bpm_and_offset"](y, SR, notes, STD_GUITAR_TUNING, False, verify_windows=[])
     assert r_none["offset_seconds"] == r_empty["offset_seconds"]
     assert r_none["confidence"] == r_empty["confidence"]
+
+
+# ── _select_bpm_stem ────────────────────────────────────────────────────────
+# Pure, no audio — the stem chosen for BEAT TRACKING (as opposed to
+# _select_stem_for_arrangement, which picks the chroma/offset source).
+
+def test_select_bpm_stem_prefers_drums(H):
+    stems = [
+        {"id": "guitar", "file": "stems/guitar.ogg"},
+        {"id": "drums", "file": "stems/drums.ogg"},
+        {"id": "full", "file": "stems/full.ogg"},
+    ]
+    assert H["_select_bpm_stem"](stems) == "stems/drums.ogg"
+
+
+def test_select_bpm_stem_falls_back_to_full_without_drums(H):
+    stems = [{"id": "guitar", "file": "stems/guitar.ogg"}, {"id": "full", "file": "stems/full.ogg"}]
+    assert H["_select_bpm_stem"](stems) == "stems/full.ogg"
+
+
+def test_select_bpm_stem_falls_back_to_first_stem_when_no_drums_or_full(H):
+    stems = [{"id": "vocals", "file": "stems/vocals.ogg"}, {"id": "guitar", "file": "stems/guitar.ogg"}]
+    assert H["_select_bpm_stem"](stems) == "stems/vocals.ogg"
+
+
+def test_select_bpm_stem_returns_none_for_empty_stem_list(H):
+    assert H["_select_bpm_stem"]([]) is None
+
+
+def test_select_bpm_stem_id_matching_is_case_insensitive(H):
+    stems = [{"id": "Drums", "file": "stems/drums.ogg"}]
+    assert H["_select_bpm_stem"](stems) == "stems/drums.ogg"
+
+
+# ── _load_disk_arrangement_notes ────────────────────────────────────────────
+# Reads an on-disk arrangement JSON (compact t/s/f/sus keys) and normalizes
+# to the wire format. Real file I/O, so these use tmp_path.
+
+def test_load_disk_arrangement_notes_normalizes_compact_keys(H, tmp_path):
+    p = tmp_path / "bass.json"
+    p.write_text(json.dumps({"notes": [{"t": 1.5, "s": 2, "f": 3, "sus": 0.4}]}))
+    notes = H["_load_disk_arrangement_notes"](str(p))
+    assert notes == [{"string": 2, "fret": 3, "time": 1.5, "sustain": 0.4}]
+
+
+def test_load_disk_arrangement_notes_chord_members_inherit_chord_time(H, tmp_path):
+    p = tmp_path / "arr.json"
+    p.write_text(json.dumps({
+        "notes": [],
+        "chords": [{
+            "t": 2.0,
+            "notes": [
+                {"s": 0, "f": 1, "sus": 0.3},           # no own time -> inherits chord's 2.0
+                {"s": 1, "f": 2, "t": 2.5, "sus": 0.2},  # own time -> 2.5
+            ],
+        }],
+    }))
+    times = sorted(n["time"] for n in H["_load_disk_arrangement_notes"](str(p)))
+    assert times == [2.0, 2.5]
+
+
+def test_load_disk_arrangement_notes_output_is_time_sorted(H, tmp_path):
+    p = tmp_path / "arr.json"
+    p.write_text(json.dumps({"notes": [{"t": 5.0, "s": 0, "f": 0}, {"t": 1.0, "s": 0, "f": 0}]}))
+    notes = H["_load_disk_arrangement_notes"](str(p))
+    assert [n["time"] for n in notes] == [1.0, 5.0]
+
+
+def test_load_disk_arrangement_notes_missing_file_returns_empty(H, tmp_path):
+    assert H["_load_disk_arrangement_notes"](str(tmp_path / "nope.json")) == []
+
+
+def test_load_disk_arrangement_notes_malformed_json_returns_empty(H, tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text("{not valid json")
+    assert H["_load_disk_arrangement_notes"](str(p)) == []
