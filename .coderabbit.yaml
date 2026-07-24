@@ -11,11 +11,10 @@ language: en-US
 early_access: false
 
 tone_instructions: >-
-  This repo is developed by a solo maintainer working with Claude Code
-  agents. PR descriptions may be AI-written; review the diff on its own
-  merits rather than the prose around it. Prioritize correctness bugs,
-  security issues (this plugin parses untrusted audio/chart uploads), and
-  violations of the conventions below over style nits.
+  PR descriptions may be AI-written; review the diff on its own merits, not
+  the prose. Prioritize correctness bugs, security issues (this plugin
+  parses untrusted audio/chart uploads), and convention violations over
+  style nits.
 
 reviews:
   profile: chill

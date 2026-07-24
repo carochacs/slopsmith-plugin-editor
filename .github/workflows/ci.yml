@@ -20,7 +20,9 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install test dependencies
-        run: pip install pytest
+        # numpy + librosa back the chroma/DTW sync-offset tests
+        # (tests/test_sync_offset.py); librosa pulls in numpy/scipy/numba.
+        run: pip install pytest numpy librosa
       - name: Run Python tests
         run: python -m pytest tests/ -v
 
